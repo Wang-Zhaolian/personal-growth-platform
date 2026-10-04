@@ -44,6 +44,13 @@ export const browserTokens = sqliteTable("browser_tokens", {
   expiresAt: text("expires_at").notNull(),
 });
 
+export const modelConnections = sqliteTable("model_connections", {
+  ownerId: text("owner_id").notNull(), providerId: text("provider_id").notNull(),
+  encryptedToken: text("encrypted_token").notNull(), selectedModel: text("selected_model").notNull(),
+  verifiedAt: text("verified_at"), isDefault: integer("is_default", { mode: "boolean" }).notNull().default(false),
+  updatedAt: text("updated_at").notNull(),
+}, (t) => [uniqueIndex("idx_model_connections_owner_provider").on(t.ownerId, t.providerId)]);
+
 export const dailyPlans = sqliteTable("daily_plans", {
   id: text("id").primaryKey(), ownerId: text("owner_id").notNull(), taskDate: text("task_date").notNull(),
   availableMinutes: integer("available_minutes").notNull(), focus: text("focus").notNull().default(""),

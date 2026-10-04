@@ -1,9 +1,0 @@
-{
-  "name": "personal-growth-plus-companion",
-  "version": "0.1.0",
-  "private": false,
-  "type": "module",
-  "engines": { "node": ">=22.13.0" },
-  "scripts": { "start": "node server.mjs" },
-  "license": "MIT"
-}

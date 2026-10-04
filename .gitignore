@@ -45,6 +45,7 @@ next-env.d.ts
 /.codex/
 /outputs/
 /work/
+/assistant/
 # Personal data exports are never source code.
 /backups/
 growth-backup*.json

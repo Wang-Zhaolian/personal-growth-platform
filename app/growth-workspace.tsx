@@ -16,8 +16,7 @@ type Candidate = Partial<Task> & { kind: "project" | "habit"; title: string; tar
 type Habit = { id: string; title: string; targetAmount: number; unit: string; estimatedMinutes: number; archived: boolean };
 type Snapshot = { records: GrowthRecord[]; drafts: GrowthDraft[]; history: GrowthHistory[]; browserToken: string; viewer: string; daily: { today: string; currentPlan: Plan | null; plans: Plan[]; tasks: Task[]; habits: Habit[]; carryovers: Task[]; recordProgress: Record<string, number> } };
 type ApiResult = { error?: string; draft?: GrowthDraft; plan?: Plan & { minutesWarning?: boolean }; daily?: Snapshot["daily"]; task?: Task; duplicate?: boolean };
-const COMPANION = "http://127.0.0.1:41739/";
-const PAIR_KEY = "personal-growth-companion-token";
+type ModelProvider = { id: string; name: string; models: { id: string; name: string }[]; connected: boolean; verified: boolean; selectedModel: string; isDefault: boolean };
 const labels: Record<View, string> = { daily: "每日任务", done: "已完成", ongoing: "进行中", planned: "待进行" };
 const icons = { daily: CalendarCheck, done: CheckCircle2, ongoing: Clock3, planned: BookOpen };
 const today = () => new Intl.DateTimeFormat("sv-SE", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
@@ -65,10 +64,11 @@ export default function GrowthWorkspace() {
   const [assistantOpen, setAssistantOpen] = useState(false);
   const [assistantTarget, setAssistantTarget] = useState<"records" | "daily">("records");
   const [assistantPrompt, setAssistantPrompt] = useState("");
-  const [pairCode, setPairCode] = useState("");
-  const [paired, setPaired] = useState(false);
-  const [models, setModels] = useState<{ slug: string; name: string }[]>([]);
-  const [model, setModel] = useState("");
+  const [modelProviders, setModelProviders] = useState<ModelProvider[]>([]);
+  const [modelProviderChoice, setModelProviderChoice] = useState("");
+  const [modelChoice, setModelChoice] = useState("");
+  const [modelToken, setModelToken] = useState("");
+  const [modelModal, setModelModal] = useState(false);
   const [draftModal, setDraftModal] = useState(false);
   const [draftId, setDraftId] = useState<string | null>(null);
   const [draftRevision, setDraftRevision] = useState<number | null>(null);
@@ -95,7 +95,14 @@ export default function GrowthWorkspace() {
     const payload = await response.json() as Snapshot & { error?: string };
     if (!response.ok) throw new Error(payload.error ?? "无法读取记录");
     setData(payload);
-    setPaired(Boolean(localStorage.getItem(PAIR_KEY)));
+    const modelResponse = await fetch("/api/models", { cache: "no-store" });
+    if (modelResponse.ok) {
+      const modelData = await modelResponse.json() as { providers: ModelProvider[] };
+      setModelProviders(modelData.providers);
+      const preferred = modelData.providers.find((provider) => provider.isDefault) ?? modelData.providers[0];
+      setModelProviderChoice((current) => current || preferred?.id || "");
+      setModelChoice((current) => current || preferred?.selectedModel || preferred?.models[0]?.id || "");
+    }
     setMinutes(payload.daily.currentPlan?.availableMinutes ?? 120);
     setFocus(payload.daily.currentPlan?.focus ?? "");
     const plan = payload.daily.currentPlan;
@@ -116,6 +123,8 @@ export default function GrowthWorkspace() {
     (category === "全部类别" || record.category === category) && (!query || [record.title, record.category, record.notes, record.outcome].some((part) => part.toLowerCase().includes(query.toLowerCase()))))
     .sort((a, b) => view === "ongoing" ? Number(a.paused) - Number(b.paused) || (a.dueDate || "9999").localeCompare(b.dueDate || "9999") || b.priority - a.priority : b.updatedAt.localeCompare(a.updatedAt)), [records, view, showArchived, category, query]);
   const currentTasks = data?.daily.currentPlan ? data.daily.tasks.filter((task) => task.planId === data.daily.currentPlan?.id) : [];
+  const activeModel = modelProviders.find((provider) => provider.isDefault && provider.verified);
+  const configuredProvider = modelProviders.find((provider) => provider.id === modelProviderChoice);
 
   const request = async (path: string, body: unknown): Promise<ApiResult> => {
     if (!data) throw new Error("页面尚未准备好");
@@ -167,32 +176,17 @@ export default function GrowthWorkspace() {
     await request("/api/growth", { action: "cancelDraft", id: draftId, revision: draftRevision });
     setDraftModal(false); setDraftId(null); await load(); setMessage("草稿已取消。");
   });
-  const assistantFetch = async (path: string, body?: unknown, method = "POST") => {
-    const token = localStorage.getItem(PAIR_KEY);
-    const response = await fetch("http://127.0.0.1:41739" + path, { method,
-      headers: { ...(body === undefined ? {} : { "Content-Type": "application/json" }), ...(token ? { "X-Growth-Companion": token } : {}) },
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
-    const result = await response.json().catch(() => ({})) as { error?: string; token?: string; models?: { slug: string; name: string }[]; text?: string };
-    if (!response.ok) throw new Error(result.error || "本机 AI 助手暂时不可用");
-    return result;
-  };
-  const pairAssistant = () => run(async () => {
-    if (!pairCode.trim()) throw new Error("请先在本机助手页面读取验证码。");
-    const response = await fetch("http://127.0.0.1:41739/pair", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code: pairCode.trim() }) });
-    const result = await response.json() as { error?: string; token?: string };
-    if (!response.ok || !result.token) throw new Error(result.error || "配对失败");
-    localStorage.setItem(PAIR_KEY, result.token); setPaired(true); setPairCode("");
-    const modelData = await assistantFetch("/models", undefined, "GET");
-    setModels(modelData.models ?? []); setModel(modelData.models?.[0]?.slug ?? ""); setMessage("本机助手已配对并读取 Plus 可用模型。");
-  });
-  const loadModels = () => run(async () => {
-    const result = await assistantFetch("/models", undefined, "GET"); setModels(result.models ?? []); setModel(result.models?.[0]?.slug ?? "");
-    setMessage("已刷新此 ChatGPT 账号可用的模型。");
+  const changeModelConfiguration = (action: "connect" | "select" | "test" | "disconnect") => run(async () => {
+    const result = await request("/api/models", { action, providerId: modelProviderChoice, modelId: modelChoice, ...(action === "connect" ? { token: modelToken } : {}) }) as ApiResult & { providers?: ModelProvider[] };
+    if (result.providers) setModelProviders(result.providers);
+    if (action === "connect") { setModelToken(""); setMessage("令牌已加密保存。请点击“测试连接”验证实际模型调用。"); }
+    if (action === "select") setMessage("已选用模型。若模型发生变化，请再次测试连接。");
+    if (action === "test") setMessage("模型实际调用成功，现在可以生成建议。");
+    if (action === "disconnect") setMessage("订阅连接已移除。");
   });
   const askAI = async (prompt: string, instructions: string) => {
-    if (!paired) { window.open(COMPANION, "_blank", "noopener,noreferrer"); throw new Error("请在本机助手页面连接 Plus 并复制验证码，再返回完成配对。"); }
-    if (!model) throw new Error("请刷新并选择一个 ChatGPT 可用模型。");
-    const result = await assistantFetch("/generate", { prompt, instructions, model });
+    if (!activeModel) throw new Error("请先在模型配置中连接订阅服务，并完成实际调用测试。");
+    const result = await request("/api/models", { action: "generate", providerId: activeModel.id, prompt, instructions }) as ApiResult & { text?: string };
     if (!result.text) throw new Error("AI 没有返回内容，请重试。");
     return result.text;
   };
@@ -276,10 +270,10 @@ export default function GrowthWorkspace() {
           return <SidebarMenuItem key={key}><SidebarMenuButton onClick={() => { setView(key); setSelectedRecordId(null); }} isActive={view === key} className="growth-nav-button"><Icon size={18} /><span>{labels[key]}</span><em>{count}</em></SidebarMenuButton></SidebarMenuItem>;
         })}
       </SidebarMenu></SidebarContent>
-      <SidebarFooter className="nav-footer"><span className="footer-user">{data?.viewer ?? "个人空间"}</span><span>成长数据保存在云端</span><span>Plus AI 在本机运行</span></SidebarFooter>
+      <SidebarFooter className="nav-footer"><span className="footer-user">{data?.viewer ?? "个人空间"}</span><span>成长数据保存在云端</span><span>AI 模型在网页配置</span></SidebarFooter>
     </Sidebar>
     <SidebarInset className="growth-main">
-      <header className="topbar"><SidebarTrigger className="menu-trigger" aria-label="打开导航" /><div className="topbar-context">{labels[view]}<span> / {today()}</span></div><div className="topbar-status"><span className="status-dot" />仅本人可见 · {paired ? "本机已配对" : "AI 待连接"}</div></header>
+      <header className="topbar"><SidebarTrigger className="menu-trigger" aria-label="打开导航" /><div className="topbar-context">{labels[view]}<span> / {today()}</span></div><div className="topbar-status"><span className="status-dot" />仅本人可见 · {activeModel ? `${activeModel.name} 已验证` : "AI 待连接"}</div></header>
       <div className="content-shell">
         {error && <div role="alert" className="feedback error">{error}<button onClick={() => setError("")} aria-label="关闭错误"><X size={16} /></button></div>}
         {message && <div role="status" className="feedback success">{message}<button onClick={() => setMessage("")} aria-label="关闭提示"><X size={16} /></button></div>}
@@ -329,7 +323,7 @@ export default function GrowthWorkspace() {
             return <div className="day-row" key={plan.id}><strong>{plan.date}</strong><span>{tasks.length} 项</span><span>{plan.status === "confirmed" ? "已确认" : "待审核"}</span><small>{tasks.filter((task) => task.completedAmount >= task.targetAmount).length} 项完成</small></div>;
           })}</div> : <p className="muted-copy">确认后的任务会保留在这里。</p>}</section>
           {pendingDrafts.length > 0 && <section className="panel pending-panel"><div className="panel-heading"><div><h2>待确认的事项整理</h2><p>网页 AI 和旧 ChatGPT 插件保存的草稿都在这里。</p></div></div><div className="pending-list">{pendingDrafts.map((draft) => <button key={draft.id} className="pending-item" onClick={() => openDraft(draft)}><strong>{draft.sourceText.slice(0, 90)}</strong><span>{draft.source === "chatgpt" ? "AI 整理" : "手动补录"} · {new Date(draft.updatedAt).toLocaleDateString("zh-CN")}</span></button>)}</div></section>}
-          <section className="panel backup-panel"><h2>设置与数据</h2><p>备份包含事项、每日计划、习惯、打卡和历史，不包含本机 Plus 凭据。</p><a className="backup-link" href="/api/backup"><Download size={16} /> 下载 JSON 备份</a>{records.length === 0 && data.drafts.length === 0 && data.history.length === 0 && data.daily.plans.length === 0 && data.daily.habits.length === 0 && <label className="restore-link"><Upload size={16} /> 恢复到空数据库<input type="file" accept="application/json,.json" onChange={(event) => { const file = event.target.files?.[0]; if (file) run(async () => { const response = await fetch("/api/backup", { method: "POST", headers: { "Content-Type": "application/json", "x-growth-token": data.browserToken }, body: await file.text() }); const result = await response.json() as { error?: string }; if (!response.ok) throw new Error(result.error || "恢复失败"); await load(); setMessage("备份已恢复。"); }); }} /></label>}</section>
+          <section className="panel backup-panel"><h2>设置与数据</h2><p>模型连接与备份分开保存；备份不包含订阅令牌。</p><div className="inline-actions"><Button variant="outline" onClick={() => setModelModal(true)}>模型配置</Button><a className="backup-link" href="/api/backup"><Download size={16} /> 下载 JSON 备份</a></div>{records.length === 0 && data.drafts.length === 0 && data.history.length === 0 && data.daily.plans.length === 0 && data.daily.habits.length === 0 && <label className="restore-link"><Upload size={16} /> 恢复到空数据库<input type="file" accept="application/json,.json" onChange={(event) => { const file = event.target.files?.[0]; if (file) run(async () => { const response = await fetch("/api/backup", { method: "POST", headers: { "Content-Type": "application/json", "x-growth-token": data.browserToken }, body: await file.text() }); const result = await response.json() as { error?: string }; if (!response.ok) throw new Error(result.error || "恢复失败"); await load(); setMessage("备份已恢复。"); }); }} /></label>}</section>
         </main> : <main>
           <div className="page-heading"><div><p className="eyebrow">成长档案 · {records.filter((record) => record.status === view && !record.archived).length} 项</p><h1>{labels[view]}</h1><p>{view === "ongoing" ? "跟踪完成比例、优先级和截止日期。" : view === "done" ? "回看已经取得的成果。" : "整理尚未启动的成长方向。"}</p></div>
             <div className="heading-actions"><Button variant="outline" onClick={() => { setAssistantTarget("records"); setAssistantOpen(true); }}><Sparkles size={16} /> AI 帮助整理</Button><Button onClick={() => openManual(undefined, view)}><Plus size={16} /> 新增事项</Button></div></div>
@@ -380,14 +374,24 @@ export default function GrowthWorkspace() {
     </section></div>}
 
     {assistantOpen && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setAssistantOpen(false); }}><section className="modal-card assistant-card" role="dialog" aria-modal="true" aria-labelledby="assistant-title">
-      <div className="modal-heading"><div><p className="eyebrow">PLUS · 本机安全连接</p><h2 id="assistant-title">{assistantTarget === "daily" ? "AI 推荐每日任务" : "AI 帮助整理成长记录"}</h2></div><button className="icon-button" onClick={() => setAssistantOpen(false)} aria-label="关闭"><X size={18} /></button></div>
-      <p className="privacy-note">使用你的 ChatGPT Plus 授权。仅把本次整理需要的文字和事项发送给 OpenAI；结果先进入审核。不会使用普通 API key。</p>
-      {!paired ? <div className="pair-box"><a className="local-assistant-link" href={COMPANION} target="_blank" rel="noreferrer">打开本机助手并连接 ChatGPT <ExternalLink size={15} /></a>
-        <label className="field-label">本机验证码<Input value={pairCode} onChange={(event) => setPairCode(event.target.value)} placeholder="在本机助手页面查看验证码" /></label><Button variant="outline" disabled={busy || !pairCode.trim()} onClick={pairAssistant}>配对本机助手</Button><p className="muted-copy">首次需要在授权窗口同意使用 ChatGPT 订阅额度。</p>
-      </div> : <div className="model-row"><label className="field-label">ChatGPT 模型<select value={model} onChange={(event) => setModel(event.target.value)}><option value="">请选择模型</option>{models.map((item) => <option key={item.slug} value={item.slug}>{item.name}</option>)}</select></label><Button variant="outline" disabled={busy} onClick={loadModels}>刷新模型</Button></div>}
+      <div className="modal-heading"><div><p className="eyebrow">AI · 网页模型配置</p><h2 id="assistant-title">{assistantTarget === "daily" ? "AI 推荐每日任务" : "AI 帮助整理成长记录"}</h2></div><button className="icon-button" onClick={() => setAssistantOpen(false)} aria-label="关闭"><X size={18} /></button></div>
+      <p className="privacy-note">{activeModel ? `当前使用 ${activeModel.name} · ${activeModel.selectedModel}。生成内容先供你审核。` : "尚未连接并验证可用模型。ChatGPT Plus 的网页订阅登录目前尚未接通。"}</p>
+      <Button variant="outline" onClick={() => setModelModal(true)}>打开模型配置</Button>
       {assistantTarget === "daily" && <div className="daily-settings assistant-settings"><label className="field-label">今天可用时间（分钟）<Input type="number" min="0" max="1440" value={minutes} onChange={(event) => setMinutes(Number(event.target.value))} /></label><label className="field-label">今天的重点<Input value={focus} onChange={(event) => setFocus(event.target.value)} /></label></div>}
       <label className="field-label">{assistantTarget === "daily" ? "补充今天的情况" : "你想记录或整理什么？"}<Textarea rows={5} value={assistantPrompt} onChange={(event) => setAssistantPrompt(event.target.value)} placeholder={assistantTarget === "daily" ? "例如：下午有课，今天先推进文献阅读，也要留出时间锻炼。" : "例如：昨天读完 8 篇文献，下周一前要提交初稿。"} /></label>
-      <div className="assistant-footer"><span>当前上下文 {assistantTarget === "records" ? records.length + " 项" : (data?.daily.carryovers.length ?? 0) + " 项可顺延"}</span><Button disabled={busy || !paired || !model} onClick={assistantTarget === "daily" ? generateDaily : generateRecordDraft}><Sparkles size={16} />{busy ? "整理中…" : "生成并预览"}</Button></div>
+      <div className="assistant-footer"><span>当前上下文 {assistantTarget === "records" ? records.length + " 项" : (data?.daily.carryovers.length ?? 0) + " 项可顺延"}</span><Button disabled={busy || !activeModel} onClick={assistantTarget === "daily" ? generateDaily : generateRecordDraft}><Sparkles size={16} />{busy ? "整理中…" : "生成并预览"}</Button></div>
+    </section></div>}
+
+    {modelModal && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setModelModal(false); }}><section className="modal-card model-config-card" role="dialog" aria-modal="true" aria-labelledby="model-config-title">
+      <div className="modal-heading"><div><p className="eyebrow">模型订阅 · 云端连接</p><h2 id="model-config-title">模型配置</h2></div><button className="icon-button" onClick={() => setModelModal(false)} aria-label="关闭"><X size={18} /></button></div>
+      <p className="privacy-note">这里只接受所列服务的订阅令牌，并在云端加密保存。保存后须实际测试模型调用才会启用。令牌不会进入网页备份。</p>
+      <div className="pair-box"><strong>ChatGPT Plus</strong><p className="muted-copy">你目前的 Plus 订阅尚不能在这个网站直接登录调用。pi-ai 的 OAuth 登录要求 Node 环境；目前的 Sites 网站没有相应云端 Node 登录服务。这里不会要求你填写 ChatGPT 密码或把 Plus 当作普通 API 余额。</p></div>
+      <div className="model-config-fields"><label className="field-label">订阅服务<select value={modelProviderChoice} onChange={(event) => { const selected = modelProviders.find((provider) => provider.id === event.target.value); setModelProviderChoice(selected?.id ?? ""); setModelChoice(selected?.selectedModel || selected?.models[0]?.id || ""); setModelToken(""); }}><option value="">请选择</option>{modelProviders.map((provider) => <option key={provider.id} value={provider.id}>{provider.name}</option>)}</select></label>
+        <label className="field-label">模型<select value={modelChoice} onChange={(event) => setModelChoice(event.target.value)}><option value="">请选择</option>{configuredProvider?.models.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
+        <label className="field-label wide">订阅令牌<Input type="password" autoComplete="off" value={modelToken} onChange={(event) => setModelToken(event.target.value)} placeholder={configuredProvider?.connected ? "已保存；需要更换时输入新令牌" : "粘贴服务商提供的订阅令牌"} /></label>
+      </div>
+      <p className="model-connection-status">状态：{configuredProvider?.verified ? "实际调用已验证" : configuredProvider?.connected ? "已保存，待测试" : "尚未连接"}{configuredProvider?.isDefault ? " · 当前选用" : ""}</p>
+      <div className="inline-actions model-config-actions"><Button disabled={busy || !modelProviderChoice || !modelChoice || !modelToken.trim()} onClick={() => changeModelConfiguration("connect")}>保存令牌</Button><Button variant="outline" disabled={busy || !configuredProvider?.connected} onClick={() => changeModelConfiguration("select")}>选用此模型</Button><Button variant="outline" disabled={busy || !configuredProvider?.connected} onClick={() => changeModelConfiguration("test")}>测试连接</Button><Button variant="ghost" disabled={busy || !configuredProvider?.connected} onClick={() => changeModelConfiguration("disconnect")}>移除连接</Button></div>
     </section></div>}
 
     {draftModal && selectedDraft && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setDraftModal(false); }}><section className="modal-card draft-card" role="dialog" aria-modal="true" aria-labelledby="draft-title">
