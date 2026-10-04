@@ -1,280 +1,421 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import {
-  BookOpen, CheckCircle2, Clock3, Download, ExternalLink, FolderTree,
-  History, Inbox, Plus, Search, Upload, X,
-} from "lucide-react";
+import { BookOpen, CalendarCheck, Check, CheckCircle2, Clock3, Download, ExternalLink, FolderTree, History, Plus, Search, Sparkles, Upload, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/ui/empty";
-import {
-  Sidebar, SidebarContent, SidebarFooter, SidebarHeader, SidebarInset, SidebarMenu,
-  SidebarMenuButton, SidebarMenuItem, SidebarProvider, SidebarTrigger,
-} from "@/components/ui/sidebar";
-import {
-  DEFAULT_CATEGORIES, dueLabel, levelLabel, statusLabel,
-  type DraftChange, type GrowthDraft, type GrowthFields, type GrowthHistory,
-  type GrowthRecord, type GrowthStatus,
-} from "@/lib/growth";
+import { Sidebar, SidebarContent, SidebarFooter, SidebarHeader, SidebarInset, SidebarMenu, SidebarMenuButton, SidebarMenuItem, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
+import { DEFAULT_CATEGORIES, dueLabel, levelLabel, statusLabel, type DraftChange, type GrowthDraft, type GrowthFields, type GrowthHistory, type GrowthRecord, type GrowthStatus } from "@/lib/growth";
 
-type View = "updates" | GrowthStatus;
-type Snapshot = {
-  records: GrowthRecord[]; drafts: GrowthDraft[]; history: GrowthHistory[];
-  browserToken: string; viewer: string;
-};
-
-const labels: Record<View, string> = {
-  updates: "每日更新", done: "已完成", ongoing: "进行中", planned: "待进行",
-};
-const icons = { updates: Inbox, done: CheckCircle2, ongoing: Clock3, planned: BookOpen };
+type View = "daily" | GrowthStatus;
+type Plan = { id: string; date: string; availableMinutes: number; focus: string; status: string; revision: number };
+type Task = { id: string; planId: string; title: string; kind: "project" | "habit"; recordId: string | null; habitId: string | null; unit: string; targetAmount: number; completedAmount: number; estimatedMinutes: number; reason: string; carryoverKey: string; sourceTaskId: string | null; position: number; status: string; revision: number };
+type Candidate = Partial<Task> & { kind: "project" | "habit"; title: string; targetAmount: number; completedAmount: number; estimatedMinutes: number; unit: string; reason: string; recordId: string | null; habitId: string | null; carryoverKey: string; sourceTaskId: string | null };
+type Habit = { id: string; title: string; targetAmount: number; unit: string; estimatedMinutes: number; archived: boolean };
+type Snapshot = { records: GrowthRecord[]; drafts: GrowthDraft[]; history: GrowthHistory[]; browserToken: string; viewer: string; daily: { today: string; currentPlan: Plan | null; plans: Plan[]; tasks: Task[]; habits: Habit[]; carryovers: Task[]; recordProgress: Record<string, number> } };
+type ApiResult = { error?: string; draft?: GrowthDraft; plan?: Plan & { minutesWarning?: boolean }; daily?: Snapshot["daily"]; task?: Task; duplicate?: boolean };
+const COMPANION = "http://127.0.0.1:41739/";
+const PAIR_KEY = "personal-growth-companion-token";
+const labels: Record<View, string> = { daily: "每日任务", done: "已完成", ongoing: "进行中", planned: "待进行" };
+const icons = { daily: CalendarCheck, done: CheckCircle2, ongoing: Clock3, planned: BookOpen };
 const today = () => new Intl.DateTimeFormat("sv-SE", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
-const blankFields = (): GrowthFields => ({
-  title: "", level: "step", category: "其他", status: "planned", parentId: null,
-  notes: "", outcome: "", links: [], startText: "", dueDate: "", completedText: "",
-  paused: false, archived: false,
-});
-const blankChange = (): DraftChange => ({ kind: "create", clientKey: crypto.randomUUID(), fields: blankFields() });
-function findProgress(record: GrowthRecord, history: GrowthHistory[]) {
-  const entry = history.find((item) => item.recordId === record.id && item.action === "progress");
-  if (!entry) return "";
-  try { return String((JSON.parse(entry.afterJson) as { progressText?: string }).progressText ?? ""); }
-  catch { return ""; }
+const blankFields = (status: GrowthStatus = "planned"): GrowthFields => ({ title: "", level: "step", category: "其他", status, parentId: null, notes: "", outcome: "", links: [], startText: "", dueDate: "", completedText: "", priority: 3, progressUnit: "", targetAmount: null, initialAmount: 0, progressWeight: 1, estimatedMinutes: null, paused: false, archived: false });
+const readProgressText = (record: GrowthRecord, history: GrowthHistory[]) => {
+  const item = history.find((entry) => entry.recordId === record.id && entry.action === "progress");
+  try { return String(item ? (JSON.parse(item.afterJson) as { progressText?: string }).progressText ?? "" : ""); } catch { return ""; }
+};
+function percent(record: GrowthRecord, records: GrowthRecord[], progress: Record<string, number>, seen = new Set<string>()): number | null {
+  if (seen.has(record.id)) return null;
+  seen.add(record.id);
+  const children = records.filter((item) => item.parentId === record.id && !item.archived);
+  if (children.length) {
+    const values = children.map((item) => ({ weight: item.progressWeight || 1, value: percent(item, records, progress, new Set(seen)) }));
+    if (values.some((item) => item.value === null)) return null;
+    const weights = values.reduce((sum, item) => sum + item.weight, 0);
+    return weights ? values.reduce((sum, item) => sum + item.weight * (item.value ?? 0), 0) / weights : null;
+  }
+  if (record.targetAmount === null || record.targetAmount <= 0) return null;
+  return Math.min(100, Math.max(0, (record.initialAmount + (progress[record.id] ?? 0)) / record.targetAmount * 100));
+}
+function deadlineNotice(record: GrowthRecord, currentDay: string) {
+  if (record.paused) return { text: `暂停提醒 · ${record.dueDate || "未设截止日期"}`, tone: "deadline-paused" };
+  const text = dueLabel(record, currentDay);
+  if (text.includes("逾期")) return { text: `⚠ ${text}`, tone: "deadline-overdue" };
+  if (text === "今天到期" || /^\d+ 天后到期$/.test(text)) return { text: `◷ ${text}`, tone: "deadline-soon" };
+  return { text, tone: "" };
+}
+function parseJson(text: string) {
+  const cleaned = text.trim().replace(/^\x60\x60\x60(?:json)?\s*/i, "").replace(/\s*\x60\x60\x60$/i, "");
+  const start = cleaned.indexOf("{"), end = cleaned.lastIndexOf("}");
+  if (start < 0 || end < start) throw new Error("AI 返回内容格式无效，请重新生成。");
+  try { return JSON.parse(cleaned.slice(start, end + 1)) as Record<string, unknown>; } catch { throw new Error("AI 返回内容格式无效，请重新生成。"); }
 }
 
 export default function GrowthWorkspace() {
   const [data, setData] = useState<Snapshot | null>(null);
-  const [view, setView] = useState<View>("updates");
+  const [view, setView] = useState<View>("daily");
   const [query, setQuery] = useState("");
   const [category, setCategory] = useState("全部类别");
   const [showArchived, setShowArchived] = useState(false);
   const [selectedRecordId, setSelectedRecordId] = useState<string | null>(null);
+  const [editFields, setEditFields] = useState<GrowthFields | null>(null);
+  const [editRecordId, setEditRecordId] = useState<string | null>(null);
+  const [assistantOpen, setAssistantOpen] = useState(false);
+  const [assistantTarget, setAssistantTarget] = useState<"records" | "daily">("records");
+  const [assistantPrompt, setAssistantPrompt] = useState("");
+  const [pairCode, setPairCode] = useState("");
+  const [paired, setPaired] = useState(false);
+  const [models, setModels] = useState<{ slug: string; name: string }[]>([]);
+  const [model, setModel] = useState("");
+  const [draftModal, setDraftModal] = useState(false);
   const [draftId, setDraftId] = useState<string | null>(null);
-  const [revision, setRevision] = useState<number | null>(null);
-  const [sourceText, setSourceText] = useState("");
-  const [changes, setChanges] = useState<DraftChange[]>([blankChange()]);
+  const [draftRevision, setDraftRevision] = useState<number | null>(null);
+  const [changes, setChanges] = useState<DraftChange[]>([]);
   const [questions, setQuestions] = useState<string[]>([]);
-  const [dirty, setDirty] = useState(false);
+  const [sourceText, setSourceText] = useState("");
+  const [minutes, setMinutes] = useState(120);
+  const [focus, setFocus] = useState("");
+  const [candidates, setCandidates] = useState<Candidate[]>([]);
+  const [checkinValues, setCheckinValues] = useState<Record<string, string>>({});
+  const [habitForm, setHabitForm] = useState(false);
+  const [habitEditingId, setHabitEditingId] = useState<string | null>(null);
+  const [showArchivedHabits, setShowArchivedHabits] = useState(false);
+  const [habitTitle, setHabitTitle] = useState("");
+  const [habitTarget, setHabitTarget] = useState(1);
+  const [habitUnit, setHabitUnit] = useState("次");
+  const [habitMinutes, setHabitMinutes] = useState(10);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
 
-  const load = useCallback(async (openId?: string) => {
+  const load = useCallback(async () => {
     const response = await fetch("/api/growth", { cache: "no-store" });
     const payload = await response.json() as Snapshot & { error?: string };
     if (!response.ok) throw new Error(payload.error ?? "无法读取记录");
     setData(payload);
-    const id = openId ?? new URLSearchParams(window.location.search).get("draft");
-    if (id) {
-      const found = payload.drafts.find((d) => d.id === id);
-      if (found) {
-        setDraftId(found.id); setRevision(found.revision); setSourceText(found.sourceText);
-        setChanges(found.changes); setQuestions(found.questions); setDirty(false); setView("updates");
-      }
-    }
+    setPaired(Boolean(localStorage.getItem(PAIR_KEY)));
+    setMinutes(payload.daily.currentPlan?.availableMinutes ?? 120);
+    setFocus(payload.daily.currentPlan?.focus ?? "");
+    const plan = payload.daily.currentPlan;
+    setCandidates(plan?.status === "draft" ? payload.daily.tasks.filter((task) => task.planId === plan.id && task.status === "suggested").map((task) => ({ ...task })) : []);
+    setCheckinValues(Object.fromEntries(payload.daily.tasks.map((task) => [task.id, String(task.completedAmount)])));
   }, []);
-
-  useEffect(() => { load().catch((e: Error) => setError(e.message)); }, [load]);
-
   useEffect(() => {
-    type Context = { registerTool: (tool: {
-      name: string; title: string; description: string; inputSchema: object;
-      annotations: { readOnlyHint: boolean }; execute: (input: unknown) => unknown;
-    }, options: { signal: AbortSignal }) => void | Promise<void> };
-    const context = (document as Document & { modelContext?: Context }).modelContext;
-    if (!context?.registerTool) return;
-    const lifecycle = new AbortController();
-    const tool = {
-      name: "stage_growth_update", title: "填写成长更新草稿",
-      description: "在每日更新页面填写一条尚未保存的成长事项，留给本人核对。不会修改数据库。",
-      inputSchema: { type: "object", properties: {
-        sourceText: { type: "string" }, title: { type: "string" },
-        category: { type: "string" }, status: { type: "string", enum: ["planned", "ongoing", "done"] },
-      }, required: ["sourceText", "title"], additionalProperties: false },
-      annotations: { readOnlyHint: false },
-      execute: (input: unknown) => {
-        if (!input || typeof input !== "object") throw new Error("输入无效");
-        const value = input as Record<string, unknown>;
-        if (typeof value.sourceText !== "string" || !value.sourceText.trim() || typeof value.title !== "string" || !value.title.trim())
-          throw new Error("请提供原始叙述和事项名称");
-        const status = ["planned", "ongoing", "done"].includes(String(value.status)) ? value.status as GrowthStatus : "planned";
-        setDraftId(null); setRevision(null); setSourceText(value.sourceText.slice(0, 10000));
-        setChanges([{ kind: "create", clientKey: crypto.randomUUID(), fields: {
-          ...blankFields(), title: value.title.slice(0, 120), category: String(value.category || "其他").slice(0, 40), status,
-        } }]);
-        setQuestions([]); setDirty(true); setView("updates");
-        return { staged: true, message: "已填写到每日更新，请本人核对并保存草稿。" };
-      },
-    };
-    try { Promise.resolve(context.registerTool(tool, { signal: lifecycle.signal })).catch(() => {}); } catch { /* Unsupported browser. */ }
-    return () => lifecycle.abort();
-  }, []);
+    const timer = window.setTimeout(() => { load().catch((reason: Error) => setError(reason.message)); }, 0);
+    return () => window.clearTimeout(timer);
+  }, [load]);
 
-  const selectedDraft = data?.drafts.find((d) => d.id === draftId) ?? null;
-  const selectedRecord = data?.records.find((r) => r.id === selectedRecordId) ?? null;
-  const categories = useMemo(() => [...new Set([...DEFAULT_CATEGORIES, ...(data?.records.map((r) => r.category) ?? [])])], [data]);
-  const pending = data?.drafts.filter((d) => d.status === "pending") ?? [];
-  const list = useMemo(() => {
-    const items = data?.records.filter((r) => r.status === view && (showArchived || !r.archived) &&
-      (category === "全部类别" || r.category === category) &&
-      (!query || [r.title, r.category, r.notes, r.outcome].some((part) => part.toLocaleLowerCase().includes(query.toLocaleLowerCase())))) ?? [];
-    return items.sort((a, b) => view === "ongoing"
-      ? (a.paused ? 1 : 0) - (b.paused ? 1 : 0) || (a.dueDate || "9999").localeCompare(b.dueDate || "9999")
-      : b.updatedAt.localeCompare(a.updatedAt));
-  }, [data, view, showArchived, category, query]);
+  const records = useMemo(() => data?.records ?? [], [data]);
+  const selectedRecord = records.find((record) => record.id === selectedRecordId) ?? null;
+  const pendingDrafts = data?.drafts.filter((draft) => draft.status === "pending") ?? [];
+  const selectedDraft = data?.drafts.find((draft) => draft.id === draftId) ?? null;
+  const categories = useMemo(() => [...new Set([...DEFAULT_CATEGORIES, ...records.map((record) => record.category)])], [records]);
+  const visibleRecords = useMemo(() => records.filter((record) => record.status === view && (showArchived || !record.archived) &&
+    (category === "全部类别" || record.category === category) && (!query || [record.title, record.category, record.notes, record.outcome].some((part) => part.toLowerCase().includes(query.toLowerCase()))))
+    .sort((a, b) => view === "ongoing" ? Number(a.paused) - Number(b.paused) || (a.dueDate || "9999").localeCompare(b.dueDate || "9999") || b.priority - a.priority : b.updatedAt.localeCompare(a.updatedAt)), [records, view, showArchived, category, query]);
+  const currentTasks = data?.daily.currentPlan ? data.daily.tasks.filter((task) => task.planId === data.daily.currentPlan?.id) : [];
 
-  const clearForm = () => {
-    setDraftId(null); setRevision(null); setSourceText(""); setChanges([blankChange()]);
-    setQuestions([]); setDirty(false); setMessage(""); setError("");
-    window.history.replaceState(null, "", "/");
-  };
-  const chooseDraft = (draft: GrowthDraft) => {
-    setDraftId(draft.id); setRevision(draft.revision); setSourceText(draft.sourceText);
-    setChanges(draft.changes); setQuestions(draft.questions); setDirty(false);
-    setView("updates"); setMessage(""); setError("");
-    window.history.replaceState(null, "", `/?draft=${encodeURIComponent(draft.id)}`);
-  };
-  const startCorrection = (record: GrowthRecord, patch?: Partial<GrowthFields>) => {
-    setDraftId(null); setRevision(null); setSourceText(`更正或更新「${record.title}」`);
-    setChanges([{ kind: "update", recordId: record.id, baseVersion: record.version,
-      fields: { title: record.title, level: record.level, category: record.category, status: record.status,
-        parentId: record.parentId, notes: record.notes, outcome: record.outcome, links: record.links,
-        startText: record.startText, dueDate: record.dueDate, completedText: record.completedText,
-        paused: record.paused, archived: record.archived, ...patch } }]);
-    setQuestions([]); setDirty(true); setView("updates"); setError(""); setMessage("");
-    window.history.replaceState(null, "", "/");
-  };
-  const startProgress = (record: GrowthRecord) => {
-    setDraftId(null); setRevision(null); setSourceText(`记录「${record.title}」的新进展`);
-    setChanges([{ kind: "progress", recordId: record.id, baseVersion: record.version, progressText: "", occurredText: today() }]);
-    setQuestions([]); setDirty(true); setView("updates"); setError(""); setMessage("");
-  };
-  const changeAt = (index: number, patch: Partial<DraftChange>) => {
-    setChanges((items) => items.map((item, i) => i === index ? { ...item, ...patch } : item)); setDirty(true);
-  };
-  const fieldAt = (index: number, field: keyof GrowthFields, value: unknown) => {
-    setChanges((items) => items.map((item, i) => i === index
-      ? { ...item, fields: { ...item.fields, [field]: value } } : item)); setDirty(true);
-  };
-  const request = async (path: string, body: unknown) => {
+  const request = async (path: string, body: unknown): Promise<ApiResult> => {
     if (!data) throw new Error("页面尚未准备好");
     const response = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json", "x-growth-token": data.browserToken }, body: JSON.stringify(body) });
-    const payload = await response.json() as { error?: string; draft?: GrowthDraft; ok?: boolean };
-    if (!response.ok) throw new Error(payload.error ?? "操作失败");
-    return payload;
+    const result = await response.json() as ApiResult;
+    if (!response.ok) throw new Error(typeof result.error === "string" ? result.error : "操作失败");
+    return result;
   };
   const run = async (operation: () => Promise<void>) => {
     setBusy(true); setError(""); setMessage("");
-    try { await operation(); } catch (e) { setError(e instanceof Error ? e.message : "操作失败"); }
-    finally { setBusy(false); }
+    try { await operation(); } catch (reason) { setError(reason instanceof Error ? reason.message : "操作失败，请稍后重试"); } finally { setBusy(false); }
   };
-  const save = () => run(async () => {
-    const result = await request("/api/growth", { action: "saveDraft", id: draftId, expectedRevision: revision,
-      sourceText, changes, questions });
-    if (result.draft) {
-      await load(result.draft.id); setMessage("草稿已保存。确认前，正式记录不会改变。");
-      window.history.replaceState(null, "", `/?draft=${encodeURIComponent(result.draft.id)}`);
-    }
+  const openManual = (record?: GrowthRecord, status?: GrowthStatus) => {
+    setEditRecordId(record?.id ?? null);
+    setEditFields(record ? { title: record.title, level: record.level, category: record.category, status: record.status, parentId: record.parentId,
+      notes: record.notes, outcome: record.outcome, links: record.links, startText: record.startText, dueDate: record.dueDate, completedText: record.completedText,
+      priority: record.priority, progressUnit: record.progressUnit, targetAmount: record.targetAmount, initialAmount: record.initialAmount,
+      progressWeight: record.progressWeight, estimatedMinutes: record.estimatedMinutes, paused: record.paused, archived: record.archived } : blankFields(status));
+  };
+  const setField = (key: keyof GrowthFields, value: unknown) => setEditFields((current) => current ? { ...current, [key]: value } : current);
+  const saveManual = () => run(async () => {
+    if (!editFields) return;
+    const record = records.find((item) => item.id === editRecordId);
+    const change: DraftChange = record ? { kind: "update", recordId: record.id, baseVersion: record.version, fields: editFields }
+      : { kind: "create", clientKey: crypto.randomUUID(), fields: editFields };
+    const draft = await request("/api/growth", { action: "saveDraft", source: "manual", sourceText: record ? "在事项详情中手动修改记录" : "手动新增成长事项", changes: [change], questions: [] });
+    if (!draft.draft) throw new Error("未能创建事项草稿");
+    await request("/api/growth", { action: "commitDraft", id: draft.draft.id, revision: draft.draft.revision });
+    setEditFields(null); await load(); setMessage("记录已保存，变更历史已更新。");
   });
-  const commit = () => run(async () => {
-    if (!draftId || revision === null) return;
-    await request("/api/growth", { action: "commitDraft", id: draftId, revision });
-    clearForm(); await load(); setMessage("已确认，成长记录已更新。");
+  const openDraft = (draft: GrowthDraft) => {
+    setDraftId(draft.id); setDraftRevision(draft.revision); setSourceText(draft.sourceText);
+    setChanges(draft.changes.map((change) => ({ ...change }))); setQuestions([...draft.questions]); setDraftModal(true);
+  };
+  const fieldAt = (index: number, key: keyof GrowthFields, value: unknown) => setChanges((items) => items.map((item, i) => i === index ? { ...item, fields: { ...item.fields, [key]: value } } : item));
+  const changeAt = (index: number, patch: Partial<DraftChange>) => setChanges((items) => items.map((item, i) => i === index ? { ...item, ...patch } : item));
+  const saveDraft = () => run(async () => {
+    const result = await request("/api/growth", { action: "saveDraft", source: "chatgpt", id: draftId, expectedRevision: draftRevision, sourceText, changes, questions });
+    if (!result.draft) throw new Error("未能保存整理草稿");
+    setDraftId(result.draft.id); setDraftRevision(result.draft.revision); await load(); setMessage("整理草稿已保存，确认前正式事项不会改变。");
   });
-  const cancel = () => run(async () => {
-    if (!draftId || revision === null) return;
-    await request("/api/growth", { action: "cancelDraft", id: draftId, revision });
-    clearForm(); await load(); setMessage("草稿已取消。");
+  const commitDraft = () => run(async () => {
+    if (!draftId || draftRevision === null) return;
+    await request("/api/growth", { action: "commitDraft", id: draftId, revision: draftRevision });
+    setDraftModal(false); setDraftId(null); await load(); setMessage("已确认，成长记录和历史已更新。");
   });
-  const restore = (file: File) => run(async () => {
-    if (!data) return;
-    const response = await fetch("/api/backup", { method: "POST", headers: { "Content-Type": "application/json", "x-growth-token": data.browserToken }, body: await file.text() });
-    const payload = await response.json() as { error?: string };
-    if (!response.ok) throw new Error(payload.error ?? "恢复失败");
-    await load(); setMessage("备份已恢复。");
+  const cancelDraft = () => run(async () => {
+    if (!draftId || draftRevision === null) return;
+    await request("/api/growth", { action: "cancelDraft", id: draftId, revision: draftRevision });
+    setDraftModal(false); setDraftId(null); await load(); setMessage("草稿已取消。");
   });
-
-  const completionSuggestions = data?.records.filter((r) => {
-    if (r.archived || r.status === "done" || r.level === "step") return false;
-    const children = data.records.filter((child) => child.parentId === r.id && !child.archived);
-    return children.length > 0 && children.every((child) => child.status === "done");
-  }) ?? [];
+  const assistantFetch = async (path: string, body?: unknown, method = "POST") => {
+    const token = localStorage.getItem(PAIR_KEY);
+    const response = await fetch("http://127.0.0.1:41739" + path, { method,
+      headers: { ...(body === undefined ? {} : { "Content-Type": "application/json" }), ...(token ? { "X-Growth-Companion": token } : {}) },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+    const result = await response.json().catch(() => ({})) as { error?: string; token?: string; models?: { slug: string; name: string }[]; text?: string };
+    if (!response.ok) throw new Error(result.error || "本机 AI 助手暂时不可用");
+    return result;
+  };
+  const pairAssistant = () => run(async () => {
+    if (!pairCode.trim()) throw new Error("请先在本机助手页面读取验证码。");
+    const response = await fetch("http://127.0.0.1:41739/pair", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code: pairCode.trim() }) });
+    const result = await response.json() as { error?: string; token?: string };
+    if (!response.ok || !result.token) throw new Error(result.error || "配对失败");
+    localStorage.setItem(PAIR_KEY, result.token); setPaired(true); setPairCode("");
+    const modelData = await assistantFetch("/models", undefined, "GET");
+    setModels(modelData.models ?? []); setModel(modelData.models?.[0]?.slug ?? ""); setMessage("本机助手已配对并读取 Plus 可用模型。");
+  });
+  const loadModels = () => run(async () => {
+    const result = await assistantFetch("/models", undefined, "GET"); setModels(result.models ?? []); setModel(result.models?.[0]?.slug ?? "");
+    setMessage("已刷新此 ChatGPT 账号可用的模型。");
+  });
+  const askAI = async (prompt: string, instructions: string) => {
+    if (!paired) { window.open(COMPANION, "_blank", "noopener,noreferrer"); throw new Error("请在本机助手页面连接 Plus 并复制验证码，再返回完成配对。"); }
+    if (!model) throw new Error("请刷新并选择一个 ChatGPT 可用模型。");
+    const result = await assistantFetch("/generate", { prompt, instructions, model });
+    if (!result.text) throw new Error("AI 没有返回内容，请重试。");
+    return result.text;
+  };
+  const compactRecords = () => records.map((record) => ({
+    id: record.id, version: record.version, title: record.title, level: record.level, category: record.category, status: record.status,
+    parentId: record.parentId, notes: record.notes, outcome: record.outcome, startText: record.startText, dueDate: record.dueDate,
+    completedText: record.completedText, paused: record.paused, archived: record.archived, priority: record.priority,
+    progressUnit: record.progressUnit, targetAmount: record.targetAmount, progress: percent(record, records, data?.daily.recordProgress ?? {}),
+  }));
+  const generateRecordDraft = () => run(async () => {
+    if (!assistantPrompt.trim()) throw new Error("先写下你要记录或整理的内容。");
+    const instructions = "你是个人成长档案整理助手。只依据用户明确提供的信息和当前事项，不编造事实、日期、成绩或技能掌握。先识别新增、更新、追加进展和状态迁移；重复事项优先复用已有ID和version。归属、时间或是否完成不确定时提出questions并避免猜测。只返回JSON对象：{summary:string,changes:DraftChange[],questions:string[]}。changes中kind为create/update/progress。已有事项要给recordId和baseVersion；新事项要给clientKey和完整fields，包括title,level,category,status,parentId,notes,outcome,links,startText,dueDate,completedText,priority,progressUnit,targetAmount,initialAmount,progressWeight,estimatedMinutes,paused,archived。";
+    const prompt = JSON.stringify({ request: assistantPrompt, categories, currentRecords: compactRecords() });
+    const parsed = parseJson(await askAI(prompt, instructions));
+    if (!Array.isArray(parsed.changes) || !parsed.changes.length) throw new Error(String(parsed.summary || "AI 没有提出事项变更。"));
+    const result = await request("/api/growth", { action: "saveDraft", source: "chatgpt", sourceText: assistantPrompt,
+      changes: parsed.changes, questions: Array.isArray(parsed.questions) ? parsed.questions : [] });
+    if (!result.draft) throw new Error("未能保存 AI 整理草稿");
+    setAssistantOpen(false); setAssistantPrompt(""); await load(); openDraft(result.draft);
+  });
+  const changeCandidate = (index: number, key: keyof Candidate, value: unknown) => setCandidates((tasks) => tasks.map((task, i) => i === index ? { ...task, [key]: value } : task));
+  const addCandidate = () => setCandidates((tasks) => [...tasks, { kind: "project", title: "", recordId: null, habitId: null, unit: "次", targetAmount: 1, completedAmount: 0, estimatedMinutes: 15, reason: "手动添加", carryoverKey: crypto.randomUUID(), sourceTaskId: null }]);
+  const generateDaily = () => run(async () => {
+    const eligible = records.filter((record) => record.status === "ongoing" && !record.paused && !record.archived && record.targetAmount !== null &&
+      !records.some((child) => child.parentId === record.id && !child.archived) && record.initialAmount + (data?.daily.recordProgress[record.id] ?? 0) < record.targetAmount);
+    const byCarryover = new Map((data?.daily.carryovers ?? []).map((task) => [task.id, task]));
+    const instructions = "你是个人成长平台每日计划助手。只从给定的进行中末级事项和习惯中选择。根据可用分钟、截止日期（7天内到期优先）、优先级（5最高）和剩余工作量安排任务。不要安排暂停、归档、待进行、已完成或剩余量为0的事项。任务预计分钟之和尽量不超过预算；如时间不足，优先最紧急且有意义的任务并在summary中解释。习惯不累积漏打卡。只有适合今天时才推荐顺延任务，使用其sourceTaskId和carryoverKey，数量不超过其剩余量。为任务估计分钟并说明原因。只返回JSON：{summary:string,tasks:[{title,kind,recordId,habitId,unit,targetAmount,estimatedMinutes,reason,carryoverKey,sourceTaskId}]}。";
+    const prompt = JSON.stringify({ date: data?.daily.today, availableMinutes: minutes, focus, userNote: assistantPrompt,
+      records: eligible.map((record) => ({ id: record.id, title: record.title, category: record.category, dueDate: record.dueDate, priority: record.priority,
+        unit: record.progressUnit, targetAmount: record.targetAmount, completedAmount: record.initialAmount + (data?.daily.recordProgress[record.id] ?? 0),
+        remainingAmount: Math.max(0, (record.targetAmount ?? 0) - record.initialAmount - (data?.daily.recordProgress[record.id] ?? 0)), estimatedMinutes: record.estimatedMinutes })),
+      habits: data?.daily.habits.filter((habit) => !habit.archived), carryovers: (data?.daily.carryovers ?? []).map((task) => ({
+        sourceTaskId: task.id, carryoverKey: task.carryoverKey, title: task.title, kind: task.kind, recordId: task.recordId, habitId: task.habitId,
+        unit: task.unit, remainingAmount: task.targetAmount - task.completedAmount, estimatedMinutes: task.estimatedMinutes,
+        originalDueDate: task.recordId ? records.find((record) => record.id === task.recordId)?.dueDate : null,
+      })) });
+    const parsed = parseJson(await askAI(prompt, instructions));
+    if (!Array.isArray(parsed.tasks)) throw new Error("AI 没有返回每日任务清单。");
+    const tasks = (parsed.tasks as Record<string, unknown>[]).map((task) => {
+      const source = byCarryover.get(String(task.sourceTaskId || ""));
+      return { ...task, carryoverKey: source?.carryoverKey ?? task.carryoverKey ?? crypto.randomUUID(),
+        sourceTaskId: source?.id ?? task.sourceTaskId ?? null, completedAmount: 0 };
+    });
+    const result = await request("/api/growth", { action: "saveDailyDraft", date: data?.daily.today,
+      availableMinutes: minutes, focus, expectedRevision: data?.daily.currentPlan?.revision, tasks });
+    await load(); setAssistantOpen(false); setAssistantPrompt("");
+    setMessage(String(parsed.summary || "每日任务建议已生成") + "。请核对后再确认。");
+    if (result.plan?.minutesWarning) setError("建议安排超过了今天可用时间，请删减或调整任务。");
+  });
+  const confirmDaily = () => run(async () => {
+    const plan = data?.daily.currentPlan;
+    if (!plan || plan.status !== "draft") return;
+    const saved = await request("/api/growth", { action: "saveDailyDraft", date: data?.daily.today, availableMinutes: minutes,
+      focus, expectedRevision: plan.revision, tasks: candidates });
+    if (!saved.plan) throw new Error("未能保存每日任务建议");
+    await request("/api/growth", { action: "confirmDailyPlan", planId: plan.id, revision: saved.plan.revision });
+    await load(); setMessage("今天的任务已确认，可以开始打卡。");
+  });
+  const saveCheckin = (task: Task) => run(async () => {
+    const completedAmount = Number(checkinValues[task.id] ?? task.completedAmount);
+    if (!Number.isFinite(completedAmount)) throw new Error("请输入有效完成量。");
+    await request("/api/growth", { action: "setTaskProgress", taskId: task.id, expectedRevision: task.revision, completedAmount,
+      idempotencyKey: crypto.randomUUID(), note: "每日任务打卡" });
+    await load(); setMessage("实际完成量已保存，关联事项进度已更新。");
+  });
+  const submitHabit = () => run(async () => {
+    await request("/api/growth", { action: "saveHabit", id: habitEditingId, title: habitTitle, targetAmount: habitTarget, unit: habitUnit, estimatedMinutes: habitMinutes, archived: false });
+    setHabitTitle(""); setHabitEditingId(null); setHabitForm(false); await load(); setMessage("每日习惯已保存。");
+  });
+  const editHabit = (habit: Habit) => { setHabitEditingId(habit.id); setHabitTitle(habit.title); setHabitTarget(habit.targetAmount); setHabitUnit(habit.unit); setHabitMinutes(habit.estimatedMinutes); setHabitForm(true); };
+  const archiveHabit = (habit: Habit, archived: boolean) => run(async () => {
+    await request("/api/growth", { action: "saveHabit", id: habit.id, title: habit.title, targetAmount: habit.targetAmount, unit: habit.unit, estimatedMinutes: habit.estimatedMinutes, archived });
+    await load(); setMessage(archived ? "习惯已归档，不会进入新的每日建议。" : "习惯已恢复。");
+  });
 
   return <SidebarProvider style={{ "--sidebar-width": "15rem" } as React.CSSProperties}>
     <Sidebar collapsible="offcanvas" className="growth-sidebar">
       <SidebarHeader className="brand-block"><span className="brand-mark"><FolderTree size={21} /></span><span><strong>个人成长平台</strong><small>我的成长档案</small></span></SidebarHeader>
       <SidebarContent className="nav-section"><p className="nav-caption">工作台</p><SidebarMenu>
-        {(["updates", "done", "ongoing", "planned"] as View[]).map((key) => {
-          const Icon = icons[key];
-          const count = key === "updates" ? pending.length : data?.records.filter((r) => r.status === key && !r.archived).length ?? 0;
-          return <SidebarMenuItem key={key}><SidebarMenuButton onClick={() => { setView(key); setSelectedRecordId(null); setError(""); }} isActive={view === key} className="growth-nav-button">
-            <Icon size={18} /><span>{labels[key]}</span><em>{count}</em>
-          </SidebarMenuButton></SidebarMenuItem>;
+        {(["daily", "done", "ongoing", "planned"] as View[]).map((key) => { const Icon = icons[key]; const count = key === "daily" ? currentTasks.length : records.filter((record) => record.status === key && !record.archived).length;
+          return <SidebarMenuItem key={key}><SidebarMenuButton onClick={() => { setView(key); setSelectedRecordId(null); }} isActive={view === key} className="growth-nav-button"><Icon size={18} /><span>{labels[key]}</span><em>{count}</em></SidebarMenuButton></SidebarMenuItem>;
         })}
       </SidebarMenu></SidebarContent>
-      <SidebarFooter className="nav-footer"><span className="footer-user">{data?.viewer ?? "个人空间"}</span><span>数据保存在云端</span></SidebarFooter>
+      <SidebarFooter className="nav-footer"><span className="footer-user">{data?.viewer ?? "个人空间"}</span><span>成长数据保存在云端</span><span>Plus AI 在本机运行</span></SidebarFooter>
     </Sidebar>
     <SidebarInset className="growth-main">
-      <header className="topbar"><SidebarTrigger className="menu-trigger" aria-label="打开导航" /><div className="topbar-context">{labels[view]}<span> / {today()}</span></div><div className="topbar-status"><span className="status-dot" />私有空间</div></header>
+      <header className="topbar"><SidebarTrigger className="menu-trigger" aria-label="打开导航" /><div className="topbar-context">{labels[view]}<span> / {today()}</span></div><div className="topbar-status"><span className="status-dot" />仅本人可见 · {paired ? "本机已配对" : "AI 待连接"}</div></header>
       <div className="content-shell">
         {error && <div role="alert" className="feedback error">{error}<button onClick={() => setError("")} aria-label="关闭错误"><X size={16} /></button></div>}
         {message && <div role="status" className="feedback success">{message}<button onClick={() => setMessage("")} aria-label="关闭提示"><X size={16} /></button></div>}
-        {!data ? <div className="loading-panel">正在读取成长记录…</div> : view === "updates"
-          ? <>
-            <div className="page-heading"><div><p className="eyebrow">记录与整理</p><h1>每日更新</h1><p>今天、过去和未来的事情，都可以从这里整理。</p></div><a className="chatgpt-link" href="https://chatgpt.com/" target="_blank" rel="noreferrer">打开 ChatGPT <ExternalLink size={16} /></a></div>
-            <div className="update-grid">
-              <section className="panel composer-panel"><div className="panel-heading"><div><h2>{draftId ? "核对更新草稿" : "写下新的更新"}</h2><p>{draftId ? "调整内容，保存草稿后再确认" : "手动补录或纠错；也可在 ChatGPT 中 @个人成长平台"}</p></div><Button variant="ghost" onClick={clearForm}>新草稿</Button></div>
-                {selectedDraft && <div className="draft-source">来源：{selectedDraft.source === "chatgpt" ? "ChatGPT 整理" : "手动补录"} · 修订 {selectedDraft.revision}</div>}
-                <label className="field-label">原始叙述<Textarea value={sourceText} onChange={(e) => { setSourceText(e.target.value); setDirty(true); }} placeholder="例如：去年完成了机器学习课程；目前在做文献综述，11月30日前完成初稿；以后想参加数据建模竞赛。" rows={4} /></label>
-                <div className="changes-heading"><strong>拟变更内容</strong><Button variant="outline" size="sm" onClick={() => { setChanges((items) => [...items, blankChange()]); setDirty(true); }}><Plus size={15} /> 添加事项</Button></div>
-                {changes.map((change, index) => {
-                  const existing = data.records.find((r) => r.id === change.recordId);
-                  const fields = { ...blankFields(), ...(existing ?? {}), ...(change.fields ?? {}) } as GrowthFields;
-                  const parents = data.records.filter((r) => fields.level === "project" ? r.level === "goal" : r.level === "project");
-                  return <div className="change-card" key={`${change.clientKey ?? change.recordId ?? "new"}-${index}`}>
-                    <div className="change-card-head"><span>变更 {index + 1}</span><div className="inline-actions"><select value={change.kind} onChange={(e) => { const kind = e.target.value as DraftChange["kind"]; changeAt(index, kind === "create" ? { kind, clientKey: crypto.randomUUID(), recordId: undefined, baseVersion: undefined, fields: blankFields() } : { kind, clientKey: undefined, fields: kind === "progress" ? undefined : change.fields }); }} aria-label="变更类型"><option value="create">新事项</option><option value="update">修改事项</option><option value="progress">追加进展</option></select><button className="icon-button" onClick={() => { setChanges((items) => items.filter((_, i) => i !== index)); setDirty(true); }} aria-label={`移除变更 ${index + 1}`}><X size={16} /></button></div></div>
-                    {change.kind !== "create" && <label className="field-label">已有事项<select value={change.recordId ?? ""} onChange={(e) => { const record = data.records.find((r) => r.id === e.target.value); changeAt(index, { recordId: record?.id, baseVersion: record?.version, fields: change.kind === "update" && record ? { ...record } : undefined }); }}><option value="">请选择事项</option>{data.records.map((record) => <option key={record.id} value={record.id}>{record.title} · {statusLabel(record.status)}</option>)}</select></label>}
-                    {change.kind === "progress" ? <label className="field-label">进展内容<Textarea value={change.progressText ?? ""} onChange={(e) => changeAt(index, { progressText: e.target.value })} rows={3} placeholder="具体做了什么，有什么结果？" /></label> : <div className="editor-grid">
-                      <label className="field-label wide">名称<Input value={fields.title} onChange={(e) => fieldAt(index, "title", e.target.value)} placeholder="课程、技能、项目或步骤名称" /></label>
-                      <label className="field-label">层级<select value={fields.level} onChange={(e) => { fieldAt(index, "level", e.target.value); fieldAt(index, "parentId", null); }}><option value="goal">目标</option><option value="project">项目</option><option value="step">步骤 / 独立事项</option></select></label>
-                      <label className="field-label">分区<select value={fields.status} onChange={(e) => { fieldAt(index, "status", e.target.value); if (e.target.value !== "ongoing") fieldAt(index, "paused", false); }}><option value="planned">待进行</option><option value="ongoing">进行中</option><option value="done">已完成</option></select></label>
-                      <label className="field-label">类别<Input list="growth-categories" value={fields.category} onChange={(e) => fieldAt(index, "category", e.target.value)} /><datalist id="growth-categories">{categories.map((name) => <option key={name} value={name} />)}</datalist></label>
-                      <label className="field-label">上级事项<select value={fields.parentId ?? ""} onChange={(e) => fieldAt(index, "parentId", e.target.value || null)} disabled={fields.level === "goal"}><option value="">无上级</option>{parents.map((r) => <option key={r.id} value={r.id}>{r.title}</option>)}{changes.filter((c) => c.kind === "create" && c.clientKey && c !== change).map((c) => <option key={c.clientKey} value={`temp:${c.clientKey}`}>本草稿新建：{c.fields?.title ?? "未命名"}</option>)}</select></label>
-                      <label className="field-label">开始时间<Input value={fields.startText} onChange={(e) => fieldAt(index, "startText", e.target.value)} placeholder="如 2025 年春" /></label>
-                      <label className="field-label">截止日期<Input type="date" value={fields.dueDate} onChange={(e) => fieldAt(index, "dueDate", e.target.value)} /></label>
-                      <label className="field-label">完成时间<Input value={fields.completedText} onChange={(e) => fieldAt(index, "completedText", e.target.value)} placeholder="可填模糊时间" /></label>
-                      <label className="field-label wide">详细笔记<Textarea value={fields.notes} onChange={(e) => fieldAt(index, "notes", e.target.value)} rows={2} placeholder="课程成绩、论文阶段等写在这里" /></label>
-                      <label className="field-label wide">成果<Textarea value={fields.outcome} onChange={(e) => fieldAt(index, "outcome", e.target.value)} rows={2} /></label>
-                      <label className="field-label wide">相关链接<Textarea value={fields.links.join("\n")} onChange={(e) => fieldAt(index, "links", e.target.value.split("\n").map((link) => link.trim()).filter(Boolean))} rows={2} placeholder="每行一个 http 或 https 链接" /></label>
-                      <label className="check-label"><input type="checkbox" checked={fields.paused} disabled={fields.status !== "ongoing"} onChange={(e) => fieldAt(index, "paused", e.target.checked)} /> 已暂停</label>
-                      <label className="check-label"><input type="checkbox" checked={fields.archived} onChange={(e) => fieldAt(index, "archived", e.target.checked)} /> 已放弃 / 归档</label>
-                    </div>}
-                    <label className="field-label">事情发生时间<Input value={change.occurredText ?? ""} onChange={(e) => changeAt(index, { occurredText: e.target.value })} placeholder="如 2025 年春；留空则不指定" /></label>
-                  </div>;
-                })}
-                <label className="field-label">仍需澄清的问题<Textarea value={questions.join("\n")} onChange={(e) => { setQuestions(e.target.value.split("\n").filter(Boolean)); setDirty(true); }} rows={questions.length ? 2 : 1} placeholder="如有疑问，每行一条；解决后删去问题再保存" /></label>
-                <div className="composer-actions"><Button disabled={busy || changes.length === 0} onClick={save}>{busy ? "处理中…" : draftId ? "保存修改" : "保存草稿"}</Button><Button variant="outline" disabled={busy || !draftId || dirty || questions.length > 0 || selectedDraft?.status !== "pending"} onClick={commit}>确认写入记录</Button>{draftId && selectedDraft?.status === "pending" && <Button variant="ghost" disabled={busy} onClick={cancel}>取消草稿</Button>}</div>
-                {dirty && draftId && <p className="helper-text">内容已改动，请先保存草稿。</p>}
-              </section>
-              <aside className="right-stack"><section className="panel"><div className="panel-heading"><h2>待确认 <span className="count-badge">{pending.length}</span></h2></div>{pending.length ? <div className="pending-list">{pending.map((draft) => <button key={draft.id} className={`pending-item ${draftId === draft.id ? "active" : ""}`} onClick={() => chooseDraft(draft)}><strong>{draft.sourceText.slice(0, 54)}</strong><span>{draft.source === "chatgpt" ? "ChatGPT 整理" : "手动补录"} · {new Date(draft.updatedAt).toLocaleDateString("zh-CN")}</span></button>)}</div> : <Empty className="compact-empty"><EmptyHeader><EmptyTitle>暂无待确认内容</EmptyTitle><EmptyDescription>在 ChatGPT 描述情况，或直接从左侧补录。</EmptyDescription></EmptyHeader></Empty>}</section>
-                {completionSuggestions.length > 0 && <section className="panel suggestion-panel"><h2>可检查的完成建议</h2>{completionSuggestions.map((record) => <button key={record.id} className="suggestion-row" onClick={() => startCorrection(record, { status: "done", paused: false })}>「{record.title}」的已列步骤均完成，检查是否也要标为已完成</button>)}</section>}
-                <section className="panel history-panel"><div className="panel-heading"><h2>最近更新</h2><History size={18} /></div>{data.history.length ? data.history.slice(0, 8).map((item) => <div className="history-row" key={item.id}><span>{data.records.find((r) => r.id === item.recordId)?.title ?? "已归档事项"}</span><small>{item.occurredText || new Date(item.createdAt).toLocaleDateString("zh-CN")} · {item.action === "create" ? "新建" : item.action === "progress" ? "进展" : "更正"}</small></div>) : <p className="muted-copy">确认后的更新会显示在这里。</p>}</section>
-                <section className="panel backup-panel"><h2>数据备份</h2><p>下载包含事项、草稿和历史的完整备份。建议每周保存一次。</p><a className="backup-link" href="/api/backup"><Download size={16} /> 下载 JSON 备份</a>{data.records.length === 0 && data.drafts.length === 0 && data.history.length === 0 && <label className="restore-link"><Upload size={16} /> 恢复到空数据库<input type="file" accept="application/json,.json" onChange={(e) => { const file = e.target.files?.[0]; if (file) restore(file); }} /></label>}</section>
-              </aside>
-            </div>
-          </>
-          : <><div className="page-heading"><div><p className="eyebrow">成长档案</p><h1>{labels[view]}</h1><p>{view === "ongoing" ? "关注当前进展与截止时间。" : view === "done" ? "回看已经取得的成果。" : "整理还未开始的方向和计划。"}</p></div><Button variant="outline" onClick={() => { clearForm(); setView("updates"); }}>去每日更新 <Plus size={16} /></Button></div>
-            <div className="filter-bar"><div className="search-box"><Search size={17} /><Input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="搜索名称、笔记和成果" aria-label="搜索事项" /></div><select value={category} onChange={(e) => setCategory(e.target.value)} aria-label="按类别筛选"><option>全部类别</option>{categories.map((c) => <option key={c}>{c}</option>)}</select><label className="check-label archived-filter"><input type="checkbox" checked={showArchived} onChange={(e) => setShowArchived(e.target.checked)} />显示归档</label></div>
-            <div className="records-layout"><section className="record-list">{list.length ? list.map((record) => {
-              const parent = data.records.find((r) => r.id === record.parentId);
-              const progress = findProgress(record, data.history);
-              return <button key={record.id} className={`record-card ${selectedRecordId === record.id ? "selected" : ""}`} onClick={() => setSelectedRecordId(record.id)}><div className="record-top"><span className="category-pill">{record.category}</span><span className="record-level">{levelLabel(record.level)}</span></div><h2>{record.title}</h2>{parent && <p className="parent-line">属于：{parent.title}</p>}{progress && <p className="progress-line">最近进展：{progress}</p>}<div className="record-bottom"><span>{view === "ongoing" ? dueLabel(record, today()) : record.archived ? "已归档" : record.completedText || record.startText || statusLabel(record.status)}</span><span>查看详情</span></div></button>;
-            }) : <Empty className="list-empty"><EmptyHeader><EmptyTitle>这里还没有事项</EmptyTitle><EmptyDescription>从“每日更新”记录，或调整筛选条件。</EmptyDescription></EmptyHeader></Empty>}</section>
-              <aside className="panel detail-panel">{selectedRecord && selectedRecord.status === view ? <><div className="detail-head"><span className="category-pill">{selectedRecord.category}</span><span>{levelLabel(selectedRecord.level)}</span></div><h2>{selectedRecord.title}</h2><p className="detail-status">{statusLabel(selectedRecord.status)}{selectedRecord.paused ? " · 已暂停" : ""}{selectedRecord.archived ? " · 已归档" : ""}</p><dl className="detail-grid"><dt>上级事项</dt><dd>{data.records.find((r) => r.id === selectedRecord.parentId)?.title ?? "无"}</dd><dt>开始时间</dt><dd>{selectedRecord.startText || "未记录"}</dd><dt>截止时间</dt><dd>{selectedRecord.dueDate || "未设截止日期"}</dd><dt>完成时间</dt><dd>{selectedRecord.completedText || "未记录"}</dd></dl>{selectedRecord.notes && <div className="detail-block"><h3>详细笔记</h3><p>{selectedRecord.notes}</p></div>}{selectedRecord.outcome && <div className="detail-block"><h3>成果</h3><p>{selectedRecord.outcome}</p></div>}{selectedRecord.links.length > 0 && <div className="detail-block"><h3>相关链接</h3>{selectedRecord.links.map((link) => <a key={link} href={link} target="_blank" rel="noreferrer">{link}<ExternalLink size={14} /></a>)}</div>}<div className="detail-block"><h3>更新记录</h3>{data.history.filter((item) => item.recordId === selectedRecord.id).slice(0, 8).map((item) => <p className="detail-history" key={item.id}>{item.occurredText || new Date(item.createdAt).toLocaleDateString("zh-CN")} · {item.action === "progress" ? (() => { try { return String((JSON.parse(item.afterJson) as { progressText?: string }).progressText ?? "新增进展"); } catch { return "新增进展"; } })() : item.action === "create" ? "创建事项" : "更新事项"}</p>)}</div><div className="detail-actions"><Button onClick={() => startCorrection(selectedRecord)}>去每日更新更正</Button><Button variant="outline" onClick={() => startProgress(selectedRecord)}>记录进展</Button></div></> : <div className="detail-empty"><FolderTree size={34} /><h2>选择一条事项</h2><p>在这里查看关联、成果和更新历史。</p></div>}</aside>
-            </div>
-          </>}
+        {!data ? <div className="loading-panel">正在读取成长记录…</div> : view === "daily" ? <main>
+          <div className="page-heading"><div><p className="eyebrow">TODAY · {data.daily.today}</p><h1>每日任务</h1><p>按今天的时间安排成长事项，完成后记录实际工作量。</p></div><div className="heading-actions">
+            <Button variant="outline" disabled={data.daily.currentPlan?.status === "confirmed"} onClick={() => { setAssistantTarget("daily"); setAssistantOpen(true); }}><Sparkles size={16} /> {data.daily.currentPlan?.status === "confirmed" ? "今日任务已确认" : "AI 推荐任务"}</Button>
+            <Button variant="outline" onClick={() => { setHabitEditingId(null); setHabitTitle(""); setHabitTarget(1); setHabitUnit("次"); setHabitMinutes(10); setHabitForm(true); }}><Plus size={16} /> 添加习惯</Button></div></div>
+          {data.daily.currentPlan?.status === "confirmed" ? <section className="panel daily-plan">
+            <div className="panel-heading"><div><h2>今日安排</h2><p>{data.daily.currentPlan.availableMinutes} 分钟 · {data.daily.currentPlan.focus || "未添加特别安排"}</p></div><span className="category-pill">已确认</span></div>
+            {currentTasks.length ? <div className="daily-task-list">{currentTasks.map((task) => {
+              const linked = task.recordId ? records.find((record) => record.id === task.recordId) : null;
+              const complete = task.completedAmount >= task.targetAmount;
+              return <article className={"daily-task " + (complete ? "task-complete" : "")} key={task.id}>
+                <div className="task-check">{complete ? <Check size={17} /> : <Clock3 size={17} />}</div><div className="task-main">
+                  <div className="task-title-row"><h3>{task.title}</h3><span>{task.estimatedMinutes} 分钟</span></div>
+                  {linked && <p className="parent-line">推进：{linked.title} · 截止 {linked.dueDate || "未设截止日期"}</p>}
+                  <p className="task-reason">{task.reason || (task.kind === "habit" ? "习惯打卡" : "项目步骤")}</p>
+                  <div className="task-progress"><div className="progress-track"><span style={{ width: Math.min(100, task.completedAmount / task.targetAmount * 100) + "%" }} /></div><span>{task.completedAmount} / {task.targetAmount} {task.unit}</span></div>
+                </div><div className="task-checkin"><label className="field-label">实际完成<Input type="number" min="0" max={task.targetAmount} step="any" value={checkinValues[task.id] ?? task.completedAmount} onChange={(event) => setCheckinValues((value) => ({ ...value, [task.id]: event.target.value }))} /></label><Button size="sm" disabled={busy} onClick={() => saveCheckin(task)}>打卡</Button></div>
+              </article>;
+            })}</div> : <p className="muted-copy">今天没有任务。你可以先添加习惯或准备明天的安排。</p>}
+          </section> : <section className="panel daily-plan">
+            <div className="panel-heading"><div><h2>{data.daily.currentPlan ? "审核每日建议" : "安排今天的时间"}</h2><p>AI 会参考时限、优先级、剩余工作量和习惯进行建议。</p></div><span className="category-pill">待审核</span></div>
+            <div className="daily-settings"><label className="field-label">今天可用时间（分钟）<Input type="number" min="0" max="1440" value={minutes} onChange={(event) => setMinutes(Number(event.target.value))} /></label><label className="field-label">今天的重点<Input value={focus} onChange={(event) => setFocus(event.target.value)} placeholder="例如：完成文献综述的方法部分" /></label></div>
+            <div className="inline-actions"><Button onClick={() => { setAssistantTarget("daily"); setAssistantOpen(true); }}><Sparkles size={16} /> AI 推荐任务</Button><Button variant="outline" onClick={addCandidate}><Plus size={16} /> 手动添加</Button></div>
+            {data.daily.carryovers.length > 0 && <p className="rollover-note">有 {data.daily.carryovers.length} 项未完成工作可加入今天的建议；不会自动顺延，需审核后确认。</p>}
+            {candidates.length > 0 && <div className="candidate-list">{candidates.map((task, index) => <article className="candidate-card" key={task.id ?? task.carryoverKey}>
+              <div className="task-title-row"><strong>建议 {index + 1}</strong><button className="icon-button" onClick={() => setCandidates((items) => items.filter((_, i) => i !== index))} aria-label="移除建议"><X size={16} /></button></div>
+              <div className="editor-grid"><label className="field-label wide">任务名称<Input value={task.title} onChange={(event) => changeCandidate(index, "title", event.target.value)} /></label>
+                <label className="field-label">类型<select value={task.kind} onChange={(event) => changeCandidate(index, "kind", event.target.value)}><option value="project">项目步骤</option><option value="habit">每日习惯</option></select></label>
+                {task.kind === "project" ? <label className="field-label">进行中步骤<select value={task.recordId ?? ""} onChange={(event) => { const record = records.find((item) => item.id === event.target.value); changeCandidate(index, "recordId", record?.id ?? null); changeCandidate(index, "unit", record?.progressUnit ?? "次"); }}><option value="">选择事项</option>{records.filter((record) => record.status === "ongoing" && !record.paused && !record.archived && record.targetAmount !== null && !records.some((child) => child.parentId === record.id && !child.archived) && record.initialAmount + (data.daily.recordProgress[record.id] ?? 0) < record.targetAmount).map((record) => <option value={record.id} key={record.id}>{record.title}</option>)}</select></label>
+                  : <label className="field-label">每日习惯<select value={task.habitId ?? ""} onChange={(event) => { const habit = data.daily.habits.find((item) => item.id === event.target.value); changeCandidate(index, "habitId", habit?.id ?? null); changeCandidate(index, "unit", habit?.unit ?? "次"); }}><option value="">选择习惯</option>{data.daily.habits.filter((habit) => !habit.archived).map((habit) => <option value={habit.id} key={habit.id}>{habit.title}</option>)}</select></label>}
+                <label className="field-label">任务量<Input type="number" min="0.01" step="any" value={task.targetAmount} onChange={(event) => changeCandidate(index, "targetAmount", Number(event.target.value))} /></label><label className="field-label">预计分钟<Input type="number" min="0" value={task.estimatedMinutes} onChange={(event) => changeCandidate(index, "estimatedMinutes", Number(event.target.value))} /></label>
+                <label className="field-label wide">推荐理由<Input value={task.reason} onChange={(event) => changeCandidate(index, "reason", event.target.value)} /></label>
+              </div>
+            </article>)}</div>}
+            <Button disabled={busy || data.daily.currentPlan?.status !== "draft"} onClick={confirmDaily}><Check size={16} /> 确认今天的任务</Button>
+          </section>}
+          {habitForm && <section className="panel habit-panel"><div className="panel-heading"><h2>{habitEditingId ? "修改每日习惯" : "添加每日习惯"}</h2><button className="icon-button" onClick={() => { setHabitForm(false); setHabitEditingId(null); }} aria-label="关闭"><X size={16} /></button></div>
+            <div className="daily-settings"><label className="field-label">习惯名称<Input value={habitTitle} onChange={(event) => setHabitTitle(event.target.value)} placeholder="例如：背英语单词" /></label><label className="field-label">每日目标<Input type="number" min="0.01" step="any" value={habitTarget} onChange={(event) => setHabitTarget(Number(event.target.value))} /></label><label className="field-label">单位<Input value={habitUnit} onChange={(event) => setHabitUnit(event.target.value)} /></label><label className="field-label">预计分钟<Input type="number" min="0" value={habitMinutes} onChange={(event) => setHabitMinutes(Number(event.target.value))} /></label></div>
+            <div className="composer-actions"><Button disabled={busy} onClick={submitHabit}>保存习惯</Button><Button variant="outline" onClick={() => { setHabitForm(false); setHabitEditingId(null); }}>取消</Button></div></section>}
+          <section className="panel habit-panel"><div className="panel-heading"><div><h2>每日习惯</h2><p>漏打卡不累积，也不会计入项目进度。</p></div><label className="check-label"><input type="checkbox" checked={showArchivedHabits} onChange={(event) => setShowArchivedHabits(event.target.checked)} />显示已归档</label></div>
+            {data.daily.habits.filter((habit) => showArchivedHabits || !habit.archived).length ? <div className="habit-list">{data.daily.habits.filter((habit) => showArchivedHabits || !habit.archived).map((habit) => <div className="habit-chip" key={habit.id}><span><CalendarCheck size={16} /> {habit.title}<small> · 每日 {habit.targetAmount} {habit.unit}</small></span><div className="inline-actions"><Button size="sm" variant="ghost" onClick={() => editHabit(habit)} disabled={habit.archived}>修改</Button><Button size="sm" variant="outline" onClick={() => archiveHabit(habit, !habit.archived)}>{habit.archived ? "恢复" : "归档"}</Button></div></div>)}</div> : <p className="muted-copy">还没有设置习惯，可添加背单词、运动等每日目标。</p>}
+          </section>
+          <section className="panel recent-days"><div className="panel-heading"><h2>近期每日计划</h2><History size={18} /></div>{data.daily.plans.length ? <div className="day-history">{data.daily.plans.slice(0, 14).map((plan) => {
+            const tasks = data.daily.tasks.filter((task) => task.planId === plan.id);
+            return <div className="day-row" key={plan.id}><strong>{plan.date}</strong><span>{tasks.length} 项</span><span>{plan.status === "confirmed" ? "已确认" : "待审核"}</span><small>{tasks.filter((task) => task.completedAmount >= task.targetAmount).length} 项完成</small></div>;
+          })}</div> : <p className="muted-copy">确认后的任务会保留在这里。</p>}</section>
+          {pendingDrafts.length > 0 && <section className="panel pending-panel"><div className="panel-heading"><div><h2>待确认的事项整理</h2><p>网页 AI 和旧 ChatGPT 插件保存的草稿都在这里。</p></div></div><div className="pending-list">{pendingDrafts.map((draft) => <button key={draft.id} className="pending-item" onClick={() => openDraft(draft)}><strong>{draft.sourceText.slice(0, 90)}</strong><span>{draft.source === "chatgpt" ? "AI 整理" : "手动补录"} · {new Date(draft.updatedAt).toLocaleDateString("zh-CN")}</span></button>)}</div></section>}
+          <section className="panel backup-panel"><h2>设置与数据</h2><p>备份包含事项、每日计划、习惯、打卡和历史，不包含本机 Plus 凭据。</p><a className="backup-link" href="/api/backup"><Download size={16} /> 下载 JSON 备份</a>{records.length === 0 && data.drafts.length === 0 && data.history.length === 0 && data.daily.plans.length === 0 && data.daily.habits.length === 0 && <label className="restore-link"><Upload size={16} /> 恢复到空数据库<input type="file" accept="application/json,.json" onChange={(event) => { const file = event.target.files?.[0]; if (file) run(async () => { const response = await fetch("/api/backup", { method: "POST", headers: { "Content-Type": "application/json", "x-growth-token": data.browserToken }, body: await file.text() }); const result = await response.json() as { error?: string }; if (!response.ok) throw new Error(result.error || "恢复失败"); await load(); setMessage("备份已恢复。"); }); }} /></label>}</section>
+        </main> : <main>
+          <div className="page-heading"><div><p className="eyebrow">成长档案 · {records.filter((record) => record.status === view && !record.archived).length} 项</p><h1>{labels[view]}</h1><p>{view === "ongoing" ? "跟踪完成比例、优先级和截止日期。" : view === "done" ? "回看已经取得的成果。" : "整理尚未启动的成长方向。"}</p></div>
+            <div className="heading-actions"><Button variant="outline" onClick={() => { setAssistantTarget("records"); setAssistantOpen(true); }}><Sparkles size={16} /> AI 帮助整理</Button><Button onClick={() => openManual(undefined, view)}><Plus size={16} /> 新增事项</Button></div></div>
+          <div className="filter-bar"><div className="search-box"><Search size={17} /><Input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索名称、笔记和成果" aria-label="搜索事项" /></div><select value={category} onChange={(event) => setCategory(event.target.value)} aria-label="按类别筛选"><option>全部类别</option>{categories.map((name) => <option key={name}>{name}</option>)}</select><label className="check-label archived-filter"><input type="checkbox" checked={showArchived} onChange={(event) => setShowArchived(event.target.checked)} />显示归档</label></div>
+          <div className="records-layout"><section className="record-list">{visibleRecords.length ? visibleRecords.map((record) => {
+            const parent = records.find((item) => item.id === record.parentId), value = percent(record, records, data.daily.recordProgress), recent = readProgressText(record, data.history);
+            return <article key={record.id} className={"record-card " + (selectedRecordId === record.id ? "selected" : "")} onClick={() => setSelectedRecordId(record.id)}>
+              <div className="record-top"><span className="category-pill">{record.category}</span><span className="record-level">{levelLabel(record.level)} · 优先级 {record.priority}</span></div><h2>{record.title}</h2>{parent && <p className="parent-line">属于：{parent.title}</p>}
+              {view === "ongoing" && <><div className="progress-line"><div className="progress-track"><span style={{ width: (value ?? 0) + "%" }} /></div><span>{value === null ? "待设置进度" : Math.round(value) + "%"}</span></div><p className="record-meta">截止：<span className={deadlineNotice(record, today()).tone}>{deadlineNotice(record, today()).text}</span> · 优先级 {record.priority}/5 · 预计 {record.estimatedMinutes === null ? "未估时" : record.estimatedMinutes + " 分钟"}</p></>}
+              {recent && <p className="progress-line">最近进展：{recent}</p>}<div className="record-bottom"><span>{view === "ongoing" ? record.paused ? "已暂停 · 暂停提醒" : value === null ? "补充工作量目标" : "剩余 " + Math.max(0, 100 - value).toFixed(0) + "%" : record.archived ? "已归档" : record.completedText || record.startText || statusLabel(record.status)}</span><span>查看详情</span></div>
+            </article>;
+          }) : <Empty className="list-empty"><EmptyHeader><EmptyTitle>这里还没有事项</EmptyTitle><EmptyDescription>可手动新增，或让 AI 根据你的叙述整理。</EmptyDescription></EmptyHeader></Empty>}</section>
+            <aside className="panel detail-panel">{selectedRecord && selectedRecord.status === view ? (() => {
+              const value = percent(selectedRecord, records, data.daily.recordProgress), children = records.filter((item) => item.parentId === selectedRecord.id && !item.archived);
+              return <><div className="detail-head"><span className="category-pill">{selectedRecord.category}</span><span>{levelLabel(selectedRecord.level)}</span></div><h2>{selectedRecord.title}</h2><p className="detail-status">{statusLabel(selectedRecord.status)}{selectedRecord.paused ? " · 已暂停" : ""}{selectedRecord.archived ? " · 已归档" : ""}</p>
+                {view === "ongoing" && <div className="detail-progress"><div className="task-title-row"><strong>{value === null ? "待设置进度" : Math.round(value) + "%"}</strong><span>优先级 {selectedRecord.priority} / 5</span></div><div className="progress-track"><span style={{ width: (value ?? 0) + "%" }} /></div>{selectedRecord.targetAmount !== null && <p>已完成 {selectedRecord.initialAmount + (data.daily.recordProgress[selectedRecord.id] ?? 0)} / {selectedRecord.targetAmount} {selectedRecord.progressUnit}</p>}{value !== null && value >= 100 && <p className="progress-complete-note">已达到目标，请核对后手动确认事项完成。</p>}</div>}
+                <dl className="detail-grid"><dt>上级事项</dt><dd>{records.find((item) => item.id === selectedRecord.parentId)?.title ?? "无"}</dd><dt>开始时间</dt><dd>{selectedRecord.startText || "未记录"}</dd><dt>截止时间</dt><dd>{selectedRecord.dueDate ? dueLabel(selectedRecord, today()) : "未设截止日期"}</dd><dt>完成时间</dt><dd>{selectedRecord.completedText || "未记录"}</dd><dt>预计耗时</dt><dd>{selectedRecord.estimatedMinutes === null ? "未估时" : selectedRecord.estimatedMinutes + " 分钟"}</dd><dt>计量目标</dt><dd>{selectedRecord.targetAmount === null ? "待设置进度" : selectedRecord.targetAmount + " " + selectedRecord.progressUnit}</dd><dt>步骤权重</dt><dd>{selectedRecord.progressWeight}</dd></dl>
+                {selectedRecord.notes && <div className="detail-block"><h3>详细笔记</h3><p>{selectedRecord.notes}</p></div>}{selectedRecord.outcome && <div className="detail-block"><h3>成果</h3><p>{selectedRecord.outcome}</p></div>}
+                {children.length > 0 && <div className="detail-block"><h3>关联步骤</h3>{children.map((child) => <p className="detail-history" key={child.id}>{child.title} · {statusLabel(child.status)}</p>)}</div>}
+                {selectedRecord.links.map((link) => <div className="detail-block" key={link}><a href={link} target="_blank" rel="noreferrer">{link}<ExternalLink size={14} /></a></div>)}
+                <div className="detail-block"><h3>变更历史</h3>{data.history.filter((item) => item.recordId === selectedRecord.id).slice(0, 8).map((item) => <p className="detail-history" key={item.id}>{item.occurredText || new Date(item.createdAt).toLocaleDateString("zh-CN")} · {item.action === "progress" ? readProgressText(selectedRecord, [item]) || "新增进展" : item.action === "create" ? "创建事项" : "更新事项"}</p>)}</div>
+                <div className="detail-actions"><Button variant="outline" onClick={() => openManual(selectedRecord)}>手动修改</Button><Button variant="outline" onClick={() => { setAssistantTarget("records"); setAssistantPrompt("请整理「" + selectedRecord.title + "」的当前情况："); setAssistantOpen(true); }}>AI 帮助整理</Button>{view === "ongoing" && <Button variant="outline" onClick={() => openManual({ ...selectedRecord, paused: !selectedRecord.paused })}>{selectedRecord.paused ? "恢复事项" : "暂停事项"}</Button>}</div>
+              </>;
+            })() : <div className="detail-empty"><FolderTree size={34} /><h2>选择一条事项</h2><p>在这里查看目标进度、关联步骤和变更历史。</p></div>}</aside>
+          </div>
+        </main>}
       </div>
     </SidebarInset>
+
+    {editFields && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setEditFields(null); }}><section className="modal-card record-editor" role="dialog" aria-modal="true" aria-labelledby="record-editor-title">
+      <div className="modal-heading"><div><p className="eyebrow">成长记录</p><h2 id="record-editor-title">{editRecordId ? "修改事项" : "新增事项"}</h2></div><button className="icon-button" onClick={() => setEditFields(null)} aria-label="关闭"><X size={18} /></button></div>
+      <div className="editor-grid"><label className="field-label wide">名称<Input value={editFields.title} onChange={(event) => setField("title", event.target.value)} placeholder="课程、技能、科研项目或步骤" /></label>
+        <label className="field-label">层级<select value={editFields.level} onChange={(event) => { setField("level", event.target.value); setField("parentId", null); }}><option value="goal">目标</option><option value="project">项目</option><option value="step">步骤 / 独立事项</option></select></label>
+        <label className="field-label">状态<select value={editFields.status} onChange={(event) => { setField("status", event.target.value); if (event.target.value !== "ongoing") setField("paused", false); }}><option value="planned">待进行</option><option value="ongoing">进行中</option><option value="done">已完成</option></select></label>
+        <label className="field-label">类别<Input list="growth-categories" value={editFields.category} onChange={(event) => setField("category", event.target.value)} /><datalist id="growth-categories">{categories.map((name) => <option key={name} value={name} />)}</datalist></label>
+        <label className="field-label">上级事项<select value={editFields.parentId ?? ""} disabled={editFields.level === "goal"} onChange={(event) => setField("parentId", event.target.value || null)}><option value="">无上级事项</option>{records.filter((item) => item.id !== editRecordId && (editFields.level === "project" ? item.level === "goal" : item.level === "project")).map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}</select></label>
+        <label className="field-label">优先级<select value={editFields.priority} onChange={(event) => setField("priority", Number(event.target.value))}>{[1,2,3,4,5].map((value) => <option value={value} key={value}>{value}</option>)}</select></label>
+        <label className="field-label">开始时间<Input value={editFields.startText} onChange={(event) => setField("startText", event.target.value)} placeholder="可写模糊日期" /></label><label className="field-label">截止日期<Input type="date" value={editFields.dueDate} onChange={(event) => setField("dueDate", event.target.value)} /></label><label className="field-label">完成时间<Input value={editFields.completedText} onChange={(event) => setField("completedText", event.target.value)} /></label>
+        <label className="field-label">工作量单位<Input value={editFields.progressUnit} onChange={(event) => setField("progressUnit", event.target.value)} placeholder="页、篇、小时、个" /></label>
+        <label className="field-label">目标工作量<Input type="number" min="0" step="any" value={editFields.targetAmount ?? ""} onChange={(event) => setField("targetAmount", event.target.value === "" ? null : Number(event.target.value))} /></label>
+        <label className="field-label">已有完成量<Input type="number" min="0" step="any" value={editFields.initialAmount} onChange={(event) => setField("initialAmount", Number(event.target.value))} /></label>
+        <label className="field-label">步骤权重<Input type="number" min="0.1" step="any" value={editFields.progressWeight} onChange={(event) => setField("progressWeight", Number(event.target.value))} /></label>
+        <label className="field-label">预计分钟<Input type="number" min="0" value={editFields.estimatedMinutes ?? ""} onChange={(event) => setField("estimatedMinutes", event.target.value === "" ? null : Number(event.target.value))} /></label>
+        <label className="field-label wide">详细笔记<Textarea rows={3} value={editFields.notes} onChange={(event) => setField("notes", event.target.value)} /></label><label className="field-label wide">成果<Textarea rows={2} value={editFields.outcome} onChange={(event) => setField("outcome", event.target.value)} /></label>
+        <label className="field-label wide">相关链接<Textarea rows={2} value={editFields.links.join("\n")} onChange={(event) => setField("links", event.target.value.split("\n").map((part) => part.trim()).filter(Boolean))} /></label>
+        <label className="check-label"><input type="checkbox" checked={editFields.paused} disabled={editFields.status !== "ongoing"} onChange={(event) => setField("paused", event.target.checked)} />已暂停</label><label className="check-label"><input type="checkbox" checked={editFields.archived} onChange={(event) => setField("archived", event.target.checked)} />已归档</label></div>
+      <div className="composer-actions"><Button disabled={busy} onClick={saveManual}>{busy ? "保存中…" : "保存修改"}</Button><Button variant="outline" onClick={() => setEditFields(null)}>取消</Button></div>
+    </section></div>}
+
+    {assistantOpen && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setAssistantOpen(false); }}><section className="modal-card assistant-card" role="dialog" aria-modal="true" aria-labelledby="assistant-title">
+      <div className="modal-heading"><div><p className="eyebrow">PLUS · 本机安全连接</p><h2 id="assistant-title">{assistantTarget === "daily" ? "AI 推荐每日任务" : "AI 帮助整理成长记录"}</h2></div><button className="icon-button" onClick={() => setAssistantOpen(false)} aria-label="关闭"><X size={18} /></button></div>
+      <p className="privacy-note">使用你的 ChatGPT Plus 授权。仅把本次整理需要的文字和事项发送给 OpenAI；结果先进入审核。不会使用普通 API key。</p>
+      {!paired ? <div className="pair-box"><a className="local-assistant-link" href={COMPANION} target="_blank" rel="noreferrer">打开本机助手并连接 ChatGPT <ExternalLink size={15} /></a>
+        <label className="field-label">本机验证码<Input value={pairCode} onChange={(event) => setPairCode(event.target.value)} placeholder="在本机助手页面查看验证码" /></label><Button variant="outline" disabled={busy || !pairCode.trim()} onClick={pairAssistant}>配对本机助手</Button><p className="muted-copy">首次需要在授权窗口同意使用 ChatGPT 订阅额度。</p>
+      </div> : <div className="model-row"><label className="field-label">ChatGPT 模型<select value={model} onChange={(event) => setModel(event.target.value)}><option value="">请选择模型</option>{models.map((item) => <option key={item.slug} value={item.slug}>{item.name}</option>)}</select></label><Button variant="outline" disabled={busy} onClick={loadModels}>刷新模型</Button></div>}
+      {assistantTarget === "daily" && <div className="daily-settings assistant-settings"><label className="field-label">今天可用时间（分钟）<Input type="number" min="0" max="1440" value={minutes} onChange={(event) => setMinutes(Number(event.target.value))} /></label><label className="field-label">今天的重点<Input value={focus} onChange={(event) => setFocus(event.target.value)} /></label></div>}
+      <label className="field-label">{assistantTarget === "daily" ? "补充今天的情况" : "你想记录或整理什么？"}<Textarea rows={5} value={assistantPrompt} onChange={(event) => setAssistantPrompt(event.target.value)} placeholder={assistantTarget === "daily" ? "例如：下午有课，今天先推进文献阅读，也要留出时间锻炼。" : "例如：昨天读完 8 篇文献，下周一前要提交初稿。"} /></label>
+      <div className="assistant-footer"><span>当前上下文 {assistantTarget === "records" ? records.length + " 项" : (data?.daily.carryovers.length ?? 0) + " 项可顺延"}</span><Button disabled={busy || !paired || !model} onClick={assistantTarget === "daily" ? generateDaily : generateRecordDraft}><Sparkles size={16} />{busy ? "整理中…" : "生成并预览"}</Button></div>
+    </section></div>}
+
+    {draftModal && selectedDraft && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setDraftModal(false); }}><section className="modal-card draft-card" role="dialog" aria-modal="true" aria-labelledby="draft-title">
+      <div className="modal-heading"><div><p className="eyebrow">逐项核对 · 正式记录尚未改变</p><h2 id="draft-title">整理结果预览</h2></div><button className="icon-button" onClick={() => setDraftModal(false)} aria-label="关闭"><X size={18} /></button></div>
+      <label className="field-label">原始叙述<Textarea rows={3} value={sourceText} onChange={(event) => setSourceText(event.target.value)} /></label><div className="changes-heading"><strong>拟变更事项</strong><Button variant="outline" size="sm" onClick={() => setChanges((items) => [...items, { kind: "create", clientKey: crypto.randomUUID(), fields: blankFields() }])}><Plus size={15} />添加事项</Button></div>
+      {changes.map((change, index) => { const record = records.find((item) => item.id === change.recordId); const fields = { ...blankFields(), ...(record ?? {}), ...(change.fields ?? {}) } as GrowthFields;
+        return <article className="change-card" key={(change.clientKey ?? change.recordId ?? "new") + index}><div className="change-card-head"><span>变更 {index + 1}</span>
+          <select value={change.kind} onChange={(event) => { const kind = event.target.value as DraftChange["kind"]; changeAt(index, kind === "create" ? { kind, clientKey: crypto.randomUUID(), recordId: undefined, baseVersion: undefined, fields: blankFields() } : { kind, clientKey: undefined, fields: kind === "progress" ? undefined : change.fields }); }}>
+            <option value="create">新增事项</option><option value="update">修改事项</option><option value="progress">追加进展</option></select><button className="icon-button" onClick={() => setChanges((items) => items.filter((_, i) => i !== index))} aria-label="移除"><X size={16} /></button></div>
+          {change.kind !== "create" && <label className="field-label">已有事项<select value={change.recordId ?? ""} onChange={(event) => { const chosen = records.find((item) => item.id === event.target.value); changeAt(index, { recordId: chosen?.id, baseVersion: chosen?.version, fields: change.kind === "update" && chosen ? { ...chosen } : undefined }); }}><option value="">选择事项</option>{records.map((item) => <option key={item.id} value={item.id}>{item.title} · {statusLabel(item.status)}</option>)}</select></label>}
+          {change.kind === "progress" ? <label className="field-label">进展内容<Textarea rows={3} value={change.progressText ?? ""} onChange={(event) => changeAt(index, { progressText: event.target.value })} /></label> : <div className="editor-grid">
+            <label className="field-label wide">名称<Input value={fields.title} onChange={(event) => fieldAt(index, "title", event.target.value)} /></label><label className="field-label">类别<Input value={fields.category} onChange={(event) => fieldAt(index, "category", event.target.value)} /></label>
+            <label className="field-label">状态<select value={fields.status} onChange={(event) => fieldAt(index, "status", event.target.value)}><option value="planned">待进行</option><option value="ongoing">进行中</option><option value="done">已完成</option></select></label>
+            <label className="field-label">层级<select value={fields.level} onChange={(event) => fieldAt(index, "level", event.target.value)}><option value="goal">目标</option><option value="project">项目</option><option value="step">步骤 / 独立事项</option></select></label>
+            <label className="field-label">上级事项<select value={fields.parentId ?? ""} disabled={fields.level === "goal"} onChange={(event) => fieldAt(index, "parentId", event.target.value || null)}><option value="">无上级事项</option>{records.filter((item) => item.id !== record?.id && (fields.level === "project" ? item.level === "goal" : item.level === "project")).map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}{changes.filter((item) => item.kind === "create" && item.clientKey !== change.clientKey && item.fields?.level === (fields.level === "project" ? "goal" : "project")).map((item) => <option key={item.clientKey} value={"temp:" + item.clientKey}>本草稿：{item.fields?.title || "新建事项"}</option>)}</select></label>
+            <label className="field-label">开始时间<Input value={fields.startText} onChange={(event) => fieldAt(index, "startText", event.target.value)} placeholder="可写模糊日期" /></label><label className="field-label">截止日期<Input type="date" value={fields.dueDate} onChange={(event) => fieldAt(index, "dueDate", event.target.value)} /></label><label className="field-label">完成时间<Input value={fields.completedText} onChange={(event) => fieldAt(index, "completedText", event.target.value)} /></label>
+            <label className="field-label">优先级<select value={fields.priority} onChange={(event) => fieldAt(index, "priority", Number(event.target.value))}>{[1,2,3,4,5].map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
+            <label className="field-label">单位<Input value={fields.progressUnit} onChange={(event) => fieldAt(index, "progressUnit", event.target.value)} /></label><label className="field-label">目标量<Input type="number" min="0" step="any" value={fields.targetAmount ?? ""} onChange={(event) => fieldAt(index, "targetAmount", event.target.value === "" ? null : Number(event.target.value))} /></label>
+            <label className="field-label">已有完成量<Input type="number" min="0" step="any" value={fields.initialAmount} onChange={(event) => fieldAt(index, "initialAmount", Number(event.target.value))} /></label><label className="field-label">步骤权重<Input type="number" min="0.1" step="any" value={fields.progressWeight} onChange={(event) => fieldAt(index, "progressWeight", Number(event.target.value))} /></label><label className="field-label">预计分钟<Input type="number" min="0" value={fields.estimatedMinutes ?? ""} onChange={(event) => fieldAt(index, "estimatedMinutes", event.target.value === "" ? null : Number(event.target.value))} /></label>
+            <label className="field-label wide">详细笔记<Textarea rows={2} value={fields.notes} onChange={(event) => fieldAt(index, "notes", event.target.value)} /></label><label className="field-label wide">成果<Textarea rows={2} value={fields.outcome} onChange={(event) => fieldAt(index, "outcome", event.target.value)} /></label><label className="field-label wide">相关链接<Textarea rows={2} value={fields.links.join("\n")} onChange={(event) => fieldAt(index, "links", event.target.value.split("\n").map((part) => part.trim()).filter(Boolean))} /></label>
+            <label className="check-label"><input type="checkbox" checked={fields.paused} disabled={fields.status !== "ongoing"} onChange={(event) => fieldAt(index, "paused", event.target.checked)} />已暂停</label><label className="check-label"><input type="checkbox" checked={fields.archived} onChange={(event) => fieldAt(index, "archived", event.target.checked)} />已归档</label>
+          </div>}
+          <label className="field-label">事情发生时间<Input value={change.occurredText ?? ""} onChange={(event) => changeAt(index, { occurredText: event.target.value })} placeholder="可填模糊时间" /></label>
+        </article>;
+      })}
+      <label className="field-label">还需要澄清的问题<Textarea rows={questions.length ? 2 : 1} value={questions.join("\n")} onChange={(event) => setQuestions(event.target.value.split("\n").filter(Boolean))} placeholder="确认前解决问题，或删除已解决的问题。" /></label>
+      <div className="composer-actions"><Button disabled={busy || !changes.length} onClick={saveDraft}>{busy ? "保存中…" : "保存草稿"}</Button><Button variant="outline" disabled={busy || selectedDraft.status !== "pending" || questions.length > 0 || selectedDraft.revision !== draftRevision} onClick={commitDraft}>确认并写入</Button>{selectedDraft.status === "pending" && <Button variant="ghost" disabled={busy} onClick={cancelDraft}>取消草稿</Button>}</div>
+      {selectedDraft.status !== "pending" && <p className="muted-copy">这份草稿已处理，不能再次写入。</p>}
+    </section></div>}
   </SidebarProvider>;
 }

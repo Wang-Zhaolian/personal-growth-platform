@@ -5,12 +5,15 @@ export type GrowthRecord = {
   id: string; ownerId: string; title: string; level: GrowthLevel; category: string;
   status: GrowthStatus; parentId: string | null; notes: string; outcome: string;
   links: string[]; startText: string; dueDate: string; completedText: string;
+  priority: number; progressUnit: string; targetAmount: number | null; initialAmount: number;
+  progressWeight: number; estimatedMinutes: number | null;
   paused: boolean; archived: boolean; version: number; createdAt: string; updatedAt: string;
 };
 
 export type GrowthFields = Pick<GrowthRecord,
   "title" | "level" | "category" | "status" | "parentId" | "notes" | "outcome" |
-  "links" | "startText" | "dueDate" | "completedText" | "paused" | "archived">;
+  "links" | "startText" | "dueDate" | "completedText" | "priority" | "progressUnit" |
+  "targetAmount" | "initialAmount" | "progressWeight" | "estimatedMinutes" | "paused" | "archived">;
 
 export type DraftChange = {
   kind: "create" | "update" | "progress";
@@ -55,6 +58,8 @@ export function normalizeFields(raw: Partial<GrowthFields>, previous?: GrowthRec
     new Date(`${dueDate}T00:00:00Z`).toISOString().slice(0, 10) !== dueDate)) throw new Error("截止日期无效");
   if (fields.level && !["goal", "project", "step"].includes(fields.level)) throw new Error("事项层级无效");
   if (fields.status && !["planned", "ongoing", "done"].includes(fields.status)) throw new Error("事项状态无效");
+  const rawTarget = fields.targetAmount as unknown;
+  const rawEstimate = fields.estimatedMinutes as unknown;
   const result: GrowthFields = {
     title: clean(fields.title, 120), category: clean(fields.category, 40),
     level: oneOf(fields.level, ["goal", "project", "step"], "step"),
@@ -62,12 +67,24 @@ export function normalizeFields(raw: Partial<GrowthFields>, previous?: GrowthRec
     parentId: clean(fields.parentId, 100) || null,
     notes: clean(fields.notes, 3000), outcome: clean(fields.outcome, 1000), links,
     startText: clean(fields.startText, 100), dueDate, completedText: clean(fields.completedText, 100),
+    priority: Math.max(1, Math.min(5, Math.round(Number(fields.priority ?? 3)))),
+    progressUnit: clean(fields.progressUnit, 30),
+    targetAmount: rawTarget === null || rawTarget === undefined || rawTarget === "" ? null : Number(rawTarget),
+    initialAmount: Number(fields.initialAmount ?? 0),
+    progressWeight: Number(fields.progressWeight ?? 1),
+    estimatedMinutes: rawEstimate === null || rawEstimate === undefined || rawEstimate === "" ? null : Number(rawEstimate),
     paused: Boolean(fields.paused), archived: Boolean(fields.archived),
   };
   if (!result.title) throw new Error("请填写事项名称");
   if (!result.category) throw new Error("请填写类别");
   if (result.paused && result.status !== "ongoing") throw new Error("只有进行中事项可以暂停");
   if (result.level === "goal" && result.parentId) throw new Error("目标不能有上级事项");
+  if (!Number.isFinite(result.priority) || result.priority < 1 || result.priority > 5) throw new Error("优先级应为 1 至 5");
+  if (!Number.isFinite(result.initialAmount) || result.initialAmount < 0) throw new Error("已完成量不能小于 0");
+  if (!Number.isFinite(result.progressWeight) || result.progressWeight <= 0) throw new Error("步骤权重必须大于 0");
+  if (result.targetAmount !== null && (!Number.isFinite(result.targetAmount) || result.targetAmount <= 0)) throw new Error("目标工作量必须大于 0");
+  if (result.estimatedMinutes !== null && (!Number.isInteger(result.estimatedMinutes) || result.estimatedMinutes < 0 || result.estimatedMinutes > 100000)) throw new Error("预计耗时无效");
+  if (result.targetAmount !== null && !result.progressUnit) throw new Error("设置目标工作量时需要填写单位");
   return result;
 }
 

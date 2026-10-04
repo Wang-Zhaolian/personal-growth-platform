@@ -25,6 +25,10 @@ function recordFrom(row: Row): GrowthRecord {
     status: row.status as GrowthRecord["status"], parentId: row.parent_id ? String(row.parent_id) : null,
     notes: String(row.notes), outcome: String(row.outcome), links: JSON.parse(String(row.links_json)) as string[],
     startText: String(row.start_text), dueDate: String(row.due_date), completedText: String(row.completed_text),
+    priority: Number(row.priority ?? 3), progressUnit: String(row.progress_unit ?? ""),
+    targetAmount: row.target_amount === null || row.target_amount === undefined ? null : Number(row.target_amount),
+    initialAmount: Number(row.initial_amount ?? 0), progressWeight: Number(row.progress_weight ?? 1),
+    estimatedMinutes: row.estimated_minutes === null || row.estimated_minutes === undefined ? null : Number(row.estimated_minutes),
     paused: Boolean(row.paused), archived: Boolean(row.archived), version: Number(row.version),
     createdAt: String(row.created_at), updatedAt: String(row.updated_at),
   };
@@ -132,8 +136,8 @@ function validateHierarchy(record: GrowthRecord, byId: Map<string, GrowthRecord>
   if (record.level === "goal") throw new GrowthError("目标不能有上级事项");
 }
 
-const insertRecordSql = "INSERT INTO records (id,owner_id,title,level,category,status,parent_id,notes,outcome,links_json,start_text,due_date,completed_text,paused,archived,version,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
-const updateRecordSql = "UPDATE records SET title=?,level=?,category=?,status=?,parent_id=?,notes=?,outcome=?,links_json=?,start_text=?,due_date=?,completed_text=?,paused=?,archived=?,version=version+1,updated_at=? WHERE id=? AND owner_id=? AND version=?";
+const insertRecordSql = "INSERT INTO records (id,owner_id,title,level,category,status,parent_id,notes,outcome,links_json,start_text,due_date,completed_text,priority,progress_unit,target_amount,initial_amount,progress_weight,estimated_minutes,paused,archived,version,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+const updateRecordSql = "UPDATE records SET title=?,level=?,category=?,status=?,parent_id=?,notes=?,outcome=?,links_json=?,start_text=?,due_date=?,completed_text=?,priority=?,progress_unit=?,target_amount=?,initial_amount=?,progress_weight=?,estimated_minutes=?,paused=?,archived=?,version=version+1,updated_at=? WHERE id=? AND owner_id=? AND version=?";
 const insertHistorySql = "INSERT INTO history (id,owner_id,draft_id,record_id,action,occurred_text,before_json,after_json,created_at) VALUES (?,?,?,?,?,?,?,?,?)";
 
 export async function commitDraft(ownerId: string, id: string, revision: number, browserToken: string) {
@@ -185,10 +189,12 @@ export async function commitDraft(ownerId: string, id: string, revision: number,
     if (!before) {
       sql.push(db().prepare(insertRecordSql).bind(after.id, ownerId, after.title, after.level, after.category, after.status,
         after.parentId, after.notes, after.outcome, JSON.stringify(after.links), after.startText, after.dueDate,
-        after.completedText, Number(after.paused), Number(after.archived), 1, stamp, stamp));
+        after.completedText, after.priority, after.progressUnit, after.targetAmount, after.initialAmount, after.progressWeight,
+        after.estimatedMinutes, Number(after.paused), Number(after.archived), 1, stamp, stamp));
     } else {
       sql.push(db().prepare(updateRecordSql).bind(after.title, after.level, after.category, after.status, after.parentId,
         after.notes, after.outcome, JSON.stringify(after.links), after.startText, after.dueDate, after.completedText,
+        after.priority, after.progressUnit, after.targetAmount, after.initialAmount, after.progressWeight, after.estimatedMinutes,
         Number(after.paused), Number(after.archived), stamp, after.id, ownerId, before.version));
       addCheck();
     }
@@ -207,21 +213,26 @@ export async function commitDraft(ownerId: string, id: string, revision: number,
 
 export async function exportData(ownerId: string) {
   const data = await overview(ownerId);
-  return { format: "personal-growth-platform", version: 1, exportedAt: now(), ...data };
+  const daily = await import("@/db/daily-store").then(({ exportDailyData }) => exportDailyData(ownerId));
+  return { format: "personal-growth-platform", version: 2, exportedAt: now(), ...data, ...daily };
 }
 
 export async function restoreData(ownerId: string, backup: unknown) {
   if (!backup || typeof backup !== "object") throw new GrowthError("备份文件无效");
   const data = backup as Record<string, unknown>;
-  if (data.format !== "personal-growth-platform" || data.version !== 1 ||
+  if (data.format !== "personal-growth-platform" || ![1, 2].includes(Number(data.version)) ||
       !Array.isArray(data.records) || !Array.isArray(data.drafts) || !Array.isArray(data.history)) throw new GrowthError("备份格式不受支持");
-  if (data.records.length > 10000 || data.drafts.length > 20000 || data.history.length > 50000) throw new GrowthError("备份过大");
+  if (data.records.length > 10000 || data.drafts.length > 20000 || data.history.length > 50000 ||
+      [data.dailyPlans, data.dailyHabits, data.dailyTasks, data.dailyTaskEvents].some((list) => Array.isArray(list) && list.length > 100000)) throw new GrowthError("备份过大");
   const existing = await overview(ownerId);
-  if (existing.records.length || existing.drafts.length || existing.history.length) throw new GrowthError("只能恢复到空数据库", 409);
+  const dailyExisting = await import("@/db/daily-store").then(({ exportDailyData }) => exportDailyData(ownerId));
+  if (existing.records.length || existing.drafts.length || existing.history.length || dailyExisting.dailyPlans.length ||
+      dailyExisting.dailyHabits.length || dailyExisting.dailyTasks.length || dailyExisting.dailyTaskEvents.length)
+    throw new GrowthError("只能恢复到空数据库", 409);
   const sql: D1PreparedStatement[] = [];
   const checkId = uuid();
-  sql.push(db().prepare("INSERT INTO commit_checks (id,ok) VALUES (?, CASE WHEN (SELECT COUNT(*) FROM records WHERE owner_id=?) + (SELECT COUNT(*) FROM drafts WHERE owner_id=?) + (SELECT COUNT(*) FROM history WHERE owner_id=?) = 0 THEN 1 ELSE 0 END)")
-    .bind(checkId, ownerId, ownerId, ownerId));
+  sql.push(db().prepare("INSERT INTO commit_checks (id,ok) VALUES (?, CASE WHEN (SELECT COUNT(*) FROM records WHERE owner_id=?) + (SELECT COUNT(*) FROM drafts WHERE owner_id=?) + (SELECT COUNT(*) FROM history WHERE owner_id=?) + (SELECT COUNT(*) FROM daily_plans WHERE owner_id=?) + (SELECT COUNT(*) FROM daily_habits WHERE owner_id=?) + (SELECT COUNT(*) FROM daily_tasks WHERE owner_id=?) + (SELECT COUNT(*) FROM daily_task_events WHERE owner_id=?) = 0 THEN 1 ELSE 0 END)")
+    .bind(checkId, ownerId, ownerId, ownerId, ownerId, ownerId, ownerId, ownerId));
   const ids = new Set<string>();
   const restoredRecords: GrowthRecord[] = [];
   for (const raw of data.records as Row[]) {
@@ -233,7 +244,8 @@ export async function restoreData(ownerId: string, backup: unknown) {
     restoredRecords.push(record);
     sql.push(db().prepare(insertRecordSql).bind(record.id, ownerId, record.title, record.level, record.category, record.status,
       record.parentId, record.notes, record.outcome, JSON.stringify(record.links), record.startText, record.dueDate,
-      record.completedText, Number(record.paused), Number(record.archived), record.version, record.createdAt, record.updatedAt));
+      record.completedText, record.priority, record.progressUnit, record.targetAmount, record.initialAmount, record.progressWeight,
+      record.estimatedMinutes, Number(record.paused), Number(record.archived), record.version, record.createdAt, record.updatedAt));
   }
   const byId = new Map(restoredRecords.map((r) => [r.id, r]));
   for (const record of restoredRecords) validateHierarchy(record, byId);
@@ -252,8 +264,15 @@ export async function restoreData(ownerId: string, backup: unknown) {
       String(raw.action), String(raw.occurredText ?? ""), raw.beforeJson === null ? null : String(raw.beforeJson),
       String(raw.afterJson), String(raw.createdAt)));
   }
+  const dailyStatements = await import("@/db/daily-store").then(({ restoreDailyStatements }) =>
+    restoreDailyStatements(ownerId, data, new Set(restoredRecords.map((record) => record.id))));
+  sql.push(...dailyStatements);
   sql.push(db().prepare("DELETE FROM commit_checks WHERE id=?").bind(checkId));
   try { await db().batch(sql); }
   catch { throw new GrowthError("恢复失败，原数据库没有被覆盖", 409); }
-  return { records: data.records.length, drafts: data.drafts.length, history: data.history.length };
+  return { records: data.records.length, drafts: data.drafts.length, history: data.history.length,
+    dailyPlans: Array.isArray(data.dailyPlans) ? data.dailyPlans.length : 0,
+    dailyHabits: Array.isArray(data.dailyHabits) ? data.dailyHabits.length : 0,
+    dailyTasks: Array.isArray(data.dailyTasks) ? data.dailyTasks.length : 0,
+    dailyTaskEvents: Array.isArray(data.dailyTaskEvents) ? data.dailyTaskEvents.length : 0 };
 }
