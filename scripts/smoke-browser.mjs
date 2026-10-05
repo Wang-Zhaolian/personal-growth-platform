@@ -20,7 +20,8 @@ if (!chromePath) throw new Error('Chrome was not found; run this check on the Wi
 const tempRoot = await mkdtemp(join(tmpdir(), 'zhaolian-browser-smoke-'));
 if (!resolve(tempRoot).startsWith(resolve(tmpdir()))) throw new Error('Refusing to use a browser profile outside the temp directory.');
 const port = 45000 + Math.floor(Math.random() * 12000);
-const app = spawn(process.execPath, ['dist/server/index.js'], { cwd: resolve('.'), env: { ...process.env, LOCALAPPDATA: tempRoot, PORT: String(port) }, stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true });
+const approved = process.env.AI_TEST_ELIGIBLE === '1';
+const app = spawn(process.execPath, ['dist/server/index.js'], { cwd: resolve('.'), env: { ...process.env, LOCALAPPDATA: tempRoot, PORT: String(port), GROWTH_SIWC_ELIGIBILITY: approved ? 'approved_private' : '' }, stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true });
 let appError = '';
 app.stderr.setEncoding('utf8').on('data', (chunk) => { appError = (appError + chunk).slice(-4000); });
 const request = async (path) => fetch(`http://127.0.0.1:${port}${path}`);
@@ -91,8 +92,8 @@ try {
   await delay(350);
   const settingsText = await evaluate('document.body.innerText');
   assert.match(settingsText, /出站网络：Windows 系统代理|出站网络：环境变量代理|出站网络：直连/);
-  assert.match(settingsText, /资格待确认/);
-  assert.equal(await evaluate("Array.from(document.querySelectorAll('button')).find(el=>el.textContent.includes('Continue with ChatGPT'))?.disabled"),true);
+  assert.match(settingsText, approved ? /资格由使用者确认已获批/ : /资格待确认/);
+  assert.equal(await evaluate("Array.from(document.querySelectorAll('button')).find(el=>el.textContent.includes('Continue with ChatGPT'))?.disabled"),!approved);
   assert.match(settingsText,/无隐私|不会上传成长记录/);
   await send('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
   await delay(150);
@@ -143,5 +144,11 @@ try {
   chrome?.kill();
   app.kill();
   await delay(300);
-  await rm(tempRoot, { recursive: true, force: true });
+  for (let attempt = 0; attempt < 8; attempt++) {
+    try { await rm(tempRoot, { recursive: true, force: true }); break; }
+    catch (error) {
+      if (attempt === 7 || !['EBUSY', 'EPERM'].includes(error.code)) throw error;
+      await delay(250);
+    }
+  }
 }
