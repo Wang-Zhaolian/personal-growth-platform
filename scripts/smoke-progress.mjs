@@ -74,10 +74,29 @@ try {
   assert.equal(item.progress_source, 'user_reported');
   assert.equal(item.due_on, '2026-10-31');
 
+  // Failure must preserve both the draft and the original row transactionally.
+  const failureDb = new Database(join(dataRoot, '个人成长平台', 'growth.db'));
+  const failedDraft = randomUUID();
+  const failureProposal = { clarification: '', suggestions: [{ ...createProposal.suggestions[0], id: item.id, expectedVersion: item.version, op: 'update', dueOn: '2026-10-31', title: 'synthetic-save-failure' }] };
+  failureDb.prepare("INSERT INTO ai_drafts(id,section,raw_input,proposal,status,created_at,updated_at) VALUES(?,?,?,?, 'pending',datetime('now'),datetime('now'))").run(failedDraft,'in_progress','synthetic original input',JSON.stringify(failureProposal));
+  failureDb.exec("CREATE TRIGGER synthetic_write_failure BEFORE UPDATE ON growth_items WHEN NEW.title='synthetic-save-failure' BEGIN SELECT RAISE(ABORT,'synthetic save failure'); END;");
+  const failedSave = await request(`/api/drafts/${failedDraft}/apply`, { method: 'POST', body: '{}' });
+  assert.equal(failedSave.response.status,500); assert.equal(failedSave.body.diagnostic.stage,'数据保存');
+  assert.equal(failureDb.prepare('SELECT raw_input FROM ai_drafts WHERE id=?').get(failedDraft).raw_input,'synthetic original input');
+  assert.equal(failureDb.prepare('SELECT status FROM ai_drafts WHERE id=?').get(failedDraft).status,'pending');
+  assert.equal(failureDb.prepare('SELECT title FROM growth_items WHERE id=?').get(item.id).title,item.title);
+  failureDb.exec('DROP TRIGGER synthetic_write_failure');
+  failureDb.close();
+
+  const literalNone = await request(`/api/drafts/${failedDraft}/apply`, { method: 'POST', body: JSON.stringify({suggestions:[{...failureProposal.suggestions[0],id:'None'}]}) });
+  assert.equal(literalNone.response.status,400);
+  const duplicateCreate = await request(`/api/drafts/${missingDeadlineDraftId}/apply`, { method: 'POST', body: '{}' });
+  assert.equal(duplicateCreate.response.status,400);
+
   const updateDraftId = randomUUID();
   const updateProposal = {
     clarification: '',
-    suggestions: [{ ...createProposal.suggestions[0], id: item.id, op: 'update', dueOn: '2026-11-02', progressPercent: 65, progressNote: '完成三组实验并开始整理数据', progressSource: 'ai_estimate' }],
+    suggestions: [{ ...createProposal.suggestions[0], id: item.id, expectedVersion: item.version, op: 'update', dueOn: '2026-11-02', progressPercent: 65, progressNote: '完成三组实验并开始整理数据', progressSource: 'ai_estimate' }],
   };
   const updateDb = new Database(join(dataRoot, '个人成长平台', 'growth.db'));
   updateDb.prepare("INSERT INTO ai_drafts(id,section,raw_input,proposal,status,created_at,updated_at) VALUES(?,?,?,?, 'pending',datetime('now'),datetime('now'))")
@@ -97,6 +116,8 @@ try {
   assert.match(updated.progress_note, /三组实验/);
   assert.ok(updated.progress_updated_at);
   assert.equal(updated.due_on, '2026-11-02');
+  const staleApply = await request(`/api/drafts/${failedDraft}/apply`, { method: 'POST', body: '{}' });
+  assert.equal(staleApply.response.status,400); assert.match(staleApply.body.error,/版本/);
 
   const undone = await request(`/api/items/${item.id}/undo`, { method: 'POST', body: '{}' });
   assert.equal(undone.response.status, 200, undone.body.error);
@@ -108,7 +129,8 @@ try {
 
   const backupResponse = await fetch(`${baseUrl}/api/backup`);
   const backup = await backupResponse.json();
-  assert.equal(backup.version, 2);
+  assert.equal(backup.version, 3);
+  assert.equal(backup.tables.growth_items.find((entry) => entry.id === item.id).version, restored.version);
   assert.equal(backup.tables.growth_items.find((entry) => entry.id === item.id).progress_percent, 30);
   const legacy = structuredClone(backup);
   legacy.version = 1;

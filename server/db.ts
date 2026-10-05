@@ -61,6 +61,12 @@ if (progressMigration.length) {
 }
 
 export const now = () => new Date().toISOString();
+if (!growthColumns.has('version')) {
+  await db.backup(join(dataDir, `before-version-migration-${Date.now()}.sqlite`));
+  db.exec('ALTER TABLE growth_items ADD COLUMN version INTEGER NOT NULL DEFAULT 0');
+}
+db.exec(`CREATE TRIGGER IF NOT EXISTS growth_item_version AFTER UPDATE ON growth_items
+WHEN NEW.version = OLD.version BEGIN UPDATE growth_items SET version = OLD.version + 1 WHERE id = NEW.id; END;`);
 export const id = () => crypto.randomUUID();
 
 export function snapshotItem(itemId: string, action: string) {

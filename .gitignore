@@ -6,6 +6,8 @@ coverage/
 .env.*
 !.env.example
 auth.json
+*.credentials.enc
+*.credentials.enc.*
 *.db
 *.sqlite
 *.sqlite-*

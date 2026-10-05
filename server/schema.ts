@@ -3,6 +3,7 @@ import { z } from 'zod';
 export const statusSchema = z.enum(['completed', 'in_progress', 'planned']);
 export const growthItemSchema = z.object({
   id: z.string().nullable().optional(), op: z.enum(['create', 'update', 'archive', 'restore', 'move']),
+  expectedVersion: z.number().int().nonnegative().optional(),
   title: z.string().trim().min(1).max(180), category: z.string().trim().min(1).max(60).optional(),
   status: statusSchema, description: z.string().max(4000).optional(), priority: z.number().int().min(1).max(3).optional(),
   startedOn: z.string().nullable().optional(), dueOn: z.string().nullable().optional(), completedOn: z.string().nullable().optional(),

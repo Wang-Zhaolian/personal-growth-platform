@@ -4,30 +4,32 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "postinstall": "node scripts/patch-pi-oauth-callback.mjs",
     "dev": "concurrently -k \"tsx watch server/index.ts\" \"vite --host 127.0.0.1\"",
-    "build": "vite build && tsc -p tsconfig.server.json",
+    "build": "vite build && tsc -p tsconfig.server.json && node scripts/build-info.mjs",
     "start": "node dist/server/index.js",
     "typecheck": "tsc --noEmit -p tsconfig.app.json && tsc --noEmit -p tsconfig.server.json",
     "desktop": "powershell -ExecutionPolicy Bypass -File scripts/create-shortcut.ps1",
     "test:progress": "npm run build && node scripts/smoke-progress.mjs",
-    "test:browser": "npm run build && node scripts/smoke-browser.mjs"
+    "test:browser": "npm run build && node scripts/smoke-browser.mjs",
+    "test:ai": "npm run build && node --test scripts/test-ai.mjs"
   },
   "dependencies": {
-    "@earendil-works/pi-ai": "1.0.2",
     "@napi-rs/keyring": "^2.1.0",
     "better-sqlite3": "^13.0.3",
     "concurrently": "^9.2.0",
     "express": "^5.1.0",
+    "jose": "6.2.12",
+    "proper-lockfile": "4.1.2",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
-    "undici": "7.29.0",
+    "undici": "7.30.0",
     "zod": "^4.1.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/express": "^5.0.3",
     "@types/node": "^24.0.0",
+    "@types/proper-lockfile": "4.1.4",
     "@types/react": "^19.1.0",
     "@types/react-dom": "^19.1.0",
     "@vitejs/plugin-react": "^5.0.0",

@@ -91,6 +91,31 @@ try {
   await delay(350);
   const settingsText = await evaluate('document.body.innerText');
   assert.match(settingsText, /出站网络：Windows 系统代理|出站网络：环境变量代理|出站网络：直连/);
+  assert.match(settingsText, /资格待确认/);
+  assert.equal(await evaluate("Array.from(document.querySelectorAll('button')).find(el=>el.textContent.includes('Continue with ChatGPT'))?.disabled"),true);
+  assert.match(settingsText,/无隐私|不会上传成长记录/);
+  await send('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
+  await delay(150);
+  assert.equal(await evaluate('document.documentElement.scrollWidth <= window.innerWidth'),true);
+  await send('Emulation.clearDeviceMetricsOverride');
+  // Browser-only synthetic transport: never opens an account authorization or spends quota.
+  await send('Page.addScriptToEvaluateOnNewDocument', { source: `(() => {
+    const originalFetch=window.fetch; let verified=false;
+    window.fetch=async (url,options) => {
+      if(url==='/api/ai/login') return new Response(JSON.stringify({login:{attemptId:'synthetic',phase:'succeeded',message:'合成登录'}}),{headers:{'content-type':'application/json'}});
+      if(url==='/api/ai/test') { verified=true; return new Response(JSON.stringify({message:'已验证可调用：收到完整响应 Hello, world!'}),{headers:{'content-type':'application/json'}}); }
+      if(url==='/api/ai/status') return new Response(JSON.stringify({eligible:true,eligibility:'合成获批资格',configured:true,activeKey:'synthetic',accounts:[{key:'synthetic',label:'合成账号',loggedIn:true}],scopes:['chatgpt.tokens.use.direct','resource.invoke'],login:{attemptId:'synthetic',phase:'succeeded'},provider:'openai',selectedModel:'synthetic-model',models:[{id:'synthetic-model',name:'Synthetic Model'}],verified:verified?{model:'synthetic-model',at:new Date().toISOString()}:undefined,diagnostics:[],network:{source:'直连',ready:true}}),{headers:{'content-type':'application/json'}});
+      return originalFetch(url,options);
+    };
+  })()` });
+  await send('Page.reload');
+  await delay(700);
+  await evaluate("document.querySelector('.settings-nav')?.click()");
+  await delay(250);
+  assert.match(await evaluate('document.body.innerText'),/已登录 · 调用待验证/);
+  await evaluate("Array.from(document.querySelectorAll('button')).find(el=>el.textContent.includes('发送无隐私测试'))?.click()");
+  await delay(250);
+  assert.match(await evaluate('document.body.innerText'),/已验证可调用/);
 
   await evaluate("Array.from(document.querySelectorAll('.side-nav .nav-item')).find((el)=>el.textContent.includes('进行中'))?.click()");
   await delay(350);

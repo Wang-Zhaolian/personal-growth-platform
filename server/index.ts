@@ -1,9 +1,10 @@
 import './network.js';
 import express from 'express';
 import { join } from 'node:path';
-import { writeFileSync } from 'node:fs';
+import { writeFileSync, readFileSync } from 'node:fs';
 import { db, id, now, snapshotItem, dataDir } from './db.js';
-import { answerAuthPrompt, beginOpenAILogin, cancelOpenAILogin, completeJSON, disconnectOpenAI, getAIStatus, getLoginSnapshot, setSelectedModel } from './ai.js';
+import { answerAuthPrompt, beginOpenAILogin, cancelOpenAILogin, completeJSON, disconnectOpenAI, getAIStatus, getLoginSnapshot, setSelectedModel, refreshModels, testConnection, selectAccount, recordDiagnostic } from './ai.js';
+import { AIError, normalizeError } from './ai-errors.js';
 import { dailyProposalSchema, dailyReplanSchema, dailyTaskSchema, growthProposalSchema } from './schema.js';
 
 const app = express();
@@ -11,6 +12,8 @@ const port = Number(process.env.PORT ?? 4178);
 app.use(express.json({ limit: '3mb' }));
 app.use((req, res, next) => {
   if (req.hostname !== '127.0.0.1' && req.hostname !== 'localhost' && req.hostname !== '[::1]') return res.sendStatus(403);
+  if (req.headers.origin && ![`http://127.0.0.1:${port}`, `http://localhost:${port}`, ...(process.env.NODE_ENV === 'development' || process.argv[1]?.endsWith('index.ts') ? ['http://127.0.0.1:5173'] : [])].includes(req.headers.origin)) return res.sendStatus(403);
+  res.setHeader('Cache-Control', 'no-store');
   next();
 });
 
@@ -18,8 +21,11 @@ function route(handler: express.RequestHandler): express.RequestHandler {
   return (req, res, next) => {
     const report = (error: unknown) => {
       if (res.headersSent) return next(error);
-      const message = error instanceof Error ? error.message : '操作失败，请重试。';
-      res.status(400).json({ error: message });
+      const storage = /SQLITE|ENOENT|EACCES|ENOSPC/.test(String((error as { code?: string })?.code));
+      const failure = error instanceof AIError ? error : storage ? normalizeError(error, '数据保存') : new AIError('业务校验', 'validation_failed', '本地业务校验未通过。', '检查输入或重新整理建议；原输入及建议保留。');
+      recordDiagnostic(failure.diagnostic);
+      const message = !(error instanceof AIError) && !storage && error instanceof Error ? error.message : failure.message;
+      res.status(storage ? 500 : 400).json({ error: message, diagnostic: failure.diagnostic });
     };
     try { Promise.resolve(handler(req, res, next)).catch(report); }
     catch (error) { report(error); }
@@ -41,7 +47,10 @@ const growthRows = `SELECT i.*, c.name AS category, g.title AS goalTitle,
     AND NOT EXISTS(SELECT 1 FROM item_history u WHERE u.action='undo:'||latest.id)) AS canUndo,
   (SELECT action FROM item_history h WHERE h.item_id=i.id AND h.action NOT LIKE 'undo:%' ORDER BY h.created_at DESC,h.rowid DESC LIMIT 1) AS lastAction
   FROM growth_items i LEFT JOIN categories c ON c.id=i.category_id LEFT JOIN goals g ON g.id=i.goal_id`;
-app.get('/api/health', (_req, res) => res.json({ ok: true }));
+let buildId = 'development';
+try { buildId = JSON.parse(readFileSync(join(process.cwd(), 'dist/build-info.json'), 'utf8')).id; } catch { /* development */ }
+app.get('/api/health', (_req, res) => res.json({ ok: true, integration: 'siwc-official-v2', buildId, startedAt: startedAt }));
+const startedAt = new Date().toISOString();
 app.get('/api/state', (req, res) => {
   const date = String(req.query.date ?? new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' }));
   ensurePlan(date);
@@ -109,7 +118,7 @@ app.patch('/api/tasks/:id', route((req, res) => {
 
 app.get('/api/ai/status', route(async (_req, res) => res.json(await getAIStatus())));
 app.get('/api/ai/events', (_req, res) => res.status(410).json({ error: '请改用 /api/ai/status 获取当前授权状态。' }));
-app.post('/api/ai/login', route(async (_req, res) => { res.json({ login: await beginOpenAILogin() }); }));
+app.post('/api/ai/login', route(async (req, res) => { res.json({ login: await beginOpenAILogin(typeof req.body.accountKey === 'string' ? req.body.accountKey : undefined, req.body.fresh === true, req.body.reconsent === true) }); }));
 app.post('/api/ai/reply', route((req, res) => {
   if (!answerAuthPrompt(String(req.body.attemptId ?? ''), String(req.body.promptId ?? ''), String(req.body.value ?? ''))) throw new Error('登录输入已过期，请重新开始授权。');
   res.json({ ok: true });
@@ -118,12 +127,12 @@ app.post('/api/ai/cancel', route((req, res) => {
   if (!cancelOpenAILogin(String(req.body.attemptId ?? ''))) throw new Error('这次授权已结束或已过期。');
   res.json({ login: getLoginSnapshot() });
 }));
-app.post('/api/ai/logout', route(async (_req, res) => { await disconnectOpenAI(); res.json({ ok: true }); }));
+app.post('/api/ai/logout', route(async (_req, res) => { res.json({ ok: true, message: await disconnectOpenAI() }); }));
+app.post('/api/ai/models', route(async (_req, res) => res.json(await refreshModels())));
+app.post('/api/ai/account', route(async (req, res) => { await selectAccount(String(req.body.key)); res.json(await getAIStatus()); }));
 app.patch('/api/ai/model', route(async (req, res) => { await setSelectedModel(String(req.body.modelId ?? '')); res.json(await getAIStatus()); }));
 app.post('/api/ai/test', route(async (_req, res) => {
-  const result = await completeJSON('Return only the JSON object {"ok":true}. Do not add other keys.', 'Connection test', (raw) => JSON.parse(raw) as { ok: boolean });
-  if (result.ok !== true) throw new Error('模型连接测试没有返回预期结果。');
-  res.json({ ok: true, message: '连接成功' });
+  res.json(await testConnection());
 }));
 
 const growthInstructions = `你是个人成长记录整理助手。用户从${'{section}'}板块输入经历、进展或计划。结合当前事项判断需要新增、修改、归档、恢复或跨状态移动。不要编造日期、成绩、成果或期限。信息不明确或冲突时，简短提出澄清问题并减少危险变更。新增或转入进行中必须收集明确的截止日期；缺失时 dueOn=null 并在 clarification 询问，不能猜日期。进行中事项必须记录 0-100 的进度；可根据用户明确陈述的里程碑估算，需设置 progressSource="ai_estimate"，并在 progressNote 说明估算依据；证据不足时 progressPercent=null 并询问。用户直接给出的百分比用 progressSource="user_reported"。对于进度没有变化的记录，省略 progressPercent/progressNote/progressSource，不要清空原值；对其他未变化字段也尽量省略。只输出一个合法 JSON 对象，结构为 {"clarification":"可为空","suggestions":[{"id":null,"op":"create|update|archive|restore|move","title":"","category":"课程|技能|科研|竞赛|实习|其他","status":"completed|in_progress|planned","description":"","priority":1,"startedOn":null,"dueOn":null,"completedOn":null,"progressPercent":50,"progressNote":"进度判断依据","progressSource":"user_reported|ai_estimate","nextAction":"","link":"","goalTitle":""}]}。update/move/archive/restore 必须使用现有事项 id；新增时 id 为 null。priority:1高2中3低。日期用 YYYY-MM-DD 或 null。`;
@@ -165,7 +174,7 @@ app.post('/api/ai/propose', route(async (req, res) => {
       suggestions: parsed.suggestions.map((item) => {
         const current = item.id ? byId.get(item.id) : undefined;
         return {
-          id: item.id ?? null, op: item.op, title: item.title,
+          id: item.op === 'create' ? null : item.id ?? null, expectedVersion: current?.version, op: item.op, title: item.title,
           category: item.category ?? (typeof current?.category === 'string' ? current.category : '其他'),
           status: item.status ?? String(current?.status ?? (section === 'in_progress' ? 'in_progress' : section === 'completed' ? 'completed' : 'planned')),
           description: item.description ?? String(current?.description ?? ''), priority: item.priority ?? Number(current?.priority ?? 2),
@@ -225,9 +234,14 @@ app.post('/api/drafts/:id/apply', route((req, res) => {
     const suggestions = req.body.suggestions === undefined ? proposal.suggestions : zodSuggestions(req.body.suggestions);
     // Validate all requested active states before any write; the transaction rolls back on every failure.
     for (const item of suggestions) {
-      if (item.op === 'archive') continue;
       const current = item.id ? db.prepare('SELECT * FROM growth_items WHERE id=?').get(item.id) as Record<string, unknown> | undefined : undefined;
       if (item.op !== 'create' && !current) throw new Error('被修改的事项已不存在，请重新生成建议。');
+      if (item.op === 'create' && item.id != null) throw new Error('新增事项不能携带更新 ID，请重新整理建议。');
+      if (item.op !== 'create') {
+        const original = proposal.suggestions.find(suggestion => suggestion.id === item.id && suggestion.op !== 'create');
+        if (!original || original.expectedVersion === undefined || original.expectedVersion !== current?.version) throw new Error('事项版本已变化或旧建议缺少版本，请重新整理；原输入及建议已保留。');
+      }
+      if (item.op === 'archive') continue;
       const dueOn = item.dueOn === undefined ? current?.due_on as string | null : item.dueOn;
       const progressPercent = item.progressPercent === undefined ? current?.progress_percent as number | null : item.progressPercent;
       const progressNote = item.progressNote === undefined ? String(current?.progress_note ?? '') : item.progressNote;
@@ -296,27 +310,27 @@ function zodSuggestions(input: unknown) { return growthProposalSchema.shape.sugg
 app.get('/api/backup', (_req, res) => {
   db.pragma('wal_checkpoint(TRUNCATE)');
   const tables = ['categories','goals','growth_items','item_history','daily_plans','daily_tasks','ai_drafts'];
-  const backup = { format: 'personal-growth-platform', version: 2, createdAt: now(), tables: Object.fromEntries(tables.map((table) => [table, db.prepare(`SELECT * FROM ${table}`).all()])) };
+  const backup = { format: 'personal-growth-platform', version: 3, createdAt: now(), tables: Object.fromEntries(tables.map((table) => [table, db.prepare(`SELECT * FROM ${table}`).all()])) };
   res.setHeader('Content-Disposition', 'attachment; filename="personal-growth-backup.json"');
   res.json(backup);
 });
 
 app.post('/api/backup/restore', route((req, res) => {
   const backup = req.body?.backup;
-  if (backup?.format !== 'personal-growth-platform' || ![1, 2].includes(backup?.version) || !backup?.tables) throw new Error('备份文件格式或版本不支持。');
+  if (backup?.format !== 'personal-growth-platform' || ![1, 2, 3].includes(backup?.version) || !backup?.tables) throw new Error('备份文件格式或版本不支持。');
   const tables = backup.tables;
   for (const name of ['categories','goals','growth_items','item_history','daily_plans','daily_tasks','ai_drafts']) if (!Array.isArray(tables[name])) throw new Error(`备份中缺少 ${name} 数据。`);
   const liveTables = ['categories','goals','growth_items','item_history','daily_plans','daily_tasks','ai_drafts'];
-  const safetyBackup = { format: 'personal-growth-platform', version: 2, createdAt: now(), tables: Object.fromEntries(liveTables.map((table) => [table, db.prepare(`SELECT * FROM ${table}`).all()])) };
+  const safetyBackup = { format: 'personal-growth-platform', version: 3, createdAt: now(), tables: Object.fromEntries(liveTables.map((table) => [table, db.prepare(`SELECT * FROM ${table}`).all()])) };
   writeFileSync(join(dataDir, `restore-safety-${Date.now()}.json`), JSON.stringify(safetyBackup, null, 2), 'utf8');
   const rollback = db.transaction(() => {
     db.exec('DELETE FROM item_history; DELETE FROM daily_tasks; DELETE FROM ai_drafts; DELETE FROM growth_items; DELETE FROM goals; DELETE FROM daily_plans; DELETE FROM categories;');
     const insertRows = (name: string, columns: string[]) => {
       const insert = db.prepare(`INSERT INTO ${name}(${columns.join(',')}) VALUES(${columns.map(() => '?').join(',')})`);
-      for (const row of tables[name] as Record<string, unknown>[]) insert.run(...columns.map((column) => column === 'progress_note' ? row[column] ?? '' : row[column] ?? null));
+      for (const row of tables[name] as Record<string, unknown>[]) insert.run(...columns.map((column) => column === 'progress_note' ? row[column] ?? '' : column === 'version' ? row[column] ?? 0 : row[column] ?? null));
     };
     insertRows('categories',['id','name','created_at']); insertRows('goals',['id','title','description','created_at','archived_at']);
-    insertRows('growth_items',['id','title','category_id','status','description','priority','started_on','due_on','completed_on','next_action','link','goal_id','progress_percent','progress_note','progress_source','progress_updated_at','created_at','updated_at','archived_at']);
+    insertRows('growth_items',['id','title','category_id','status','description','priority','started_on','due_on','completed_on','next_action','link','goal_id','progress_percent','progress_note','progress_source','progress_updated_at','created_at','updated_at','archived_at','version']);
     insertRows('item_history',['id','item_id','snapshot','action','created_at']); insertRows('daily_plans',['date','budget_minutes','created_at','updated_at']);
     insertRows('daily_tasks',['id','plan_date','title','estimate_minutes','actual_minutes','priority','completion_criteria','item_id','status','created_at','updated_at']);
     insertRows('ai_drafts',['id','section','raw_input','proposal','status','created_at','updated_at']);
