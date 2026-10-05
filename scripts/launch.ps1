@@ -1,4 +1,5 @@
-﻿$ErrorActionPreference = 'Stop'
+﻿param([switch]$Restart)
+$ErrorActionPreference = 'Stop'
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $env:LOCALAPPDATA = [Environment]::GetFolderPath('LocalApplicationData')
 # This project's private-client approval was confirmed by the user for this installation.
@@ -8,7 +9,7 @@ $expected = (Get-Content -LiteralPath (Join-Path $projectRoot 'dist\build-info.j
 $entry = Join-Path $projectRoot 'dist\server\index.js'
 $ready = $false
 try { $health = Invoke-RestMethod -Uri "$url/api/health" -TimeoutSec 1; $ready = $health.ok -eq $true } catch { }
-if ($ready -and $health.buildId -ne $expected) {
+if ($ready -and ($health.buildId -ne $expected -or $Restart)) {
   try {
     $authState = Invoke-RestMethod -Uri "$url/api/ai/status" -TimeoutSec 2
     if (@('starting','waiting','exchanging','saving') -contains $authState.login.phase) {

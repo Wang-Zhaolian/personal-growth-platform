@@ -19,7 +19,7 @@
 | 文件 | 职责 |
 | --- | --- |
 | server/ai-auth.ts | OAuth 回调、JWT 验证、实际 scope、独立账号注册、刷新、撤销 |
-| server/ai-vault.ts | OS 保护的短密钥、AES-GCM 凭据文件、跨进程锁、原子替换 |
+| server/ai-vault.ts | OS 保护的短密钥、AES-GCM 加密的 SQLite 凭据、跨进程锁和数据库原子提交 |
 | server/ai-inference.ts | 账号模型目录、Responses 请求、严格流式完成判断 |
 | server/ai-errors.ts | 脱敏阶段、HTTP 状态、错误码、请求 ID、中文建议 |
 | server/ai.ts | 与平台配置连接，最小连接测试，业务 JSON 解析 |

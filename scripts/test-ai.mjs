@@ -94,6 +94,10 @@ test('stream requires completed event; rejects failure, incomplete, malformed, t
   await assert.rejects(readResponseStream(stream([delta,{type:'response.incomplete'}])),code('response_incomplete'));
   await assert.rejects(readResponseStream(stream([{type:'response.failed',response:{error:{code:'insufficient_quota'}}}])),code('insufficient_quota'));
   await assert.rejects(readResponseStream(new Response('data: {broken}\n\n',{headers:{'content-type':'text/event-stream'}})),code('invalid_event'));
+  // Some proxies mislabel SSE. Terminal event validation, not the header,
+  // determines whether a streamed response may be accepted.
+  assert.equal((await readResponseStream(new Response('data: {"type":"response.output_text.delta","delta":"ok"}\n\ndata: {"type":"response.completed","response":{"status":"completed"}}\n\n',{headers:{'content-type':'application/json'}}))).text,'ok');
+  await assert.rejects(readResponseStream(new Response('{"status":"completed"}',{headers:{'content-type':'application/json'}})),code('invalid_stream_application_json'));
 });
 test('account model catalog and actual Responses request use documented protocol', async () => {
   assert.throws(() => parseModels({data:[{id:'guessed-model'}]}),code('invalid_catalog'));

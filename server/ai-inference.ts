@@ -10,12 +10,14 @@ export function parseModels(value: unknown): ModelChoice[] {
 // HTTP 200, a text delta or [DONE] alone is insufficient.
 export async function readResponseStream(response: Response) {
   const requestId = response.headers.get('x-request-id') ?? undefined;
-  if (!response.body || !response.headers.get('content-type')?.includes('text/event-stream')) throw new AIError('结果解析', 'invalid_stream', '服务端未返回预期的事件流。', undefined, response.status, requestId);
+  const mediaType = (response.headers.get('content-type') ?? 'missing').split(';')[0].trim().toLowerCase();
+  if (!response.body) throw new AIError('结果解析', 'empty_stream', '服务端没有返回响应体。', '请记录请求 ID 并重试。', response.status, requestId);
   const reader = response.body.getReader(), decoder = new TextDecoder();
-  let buffer = '', text = '', completed = false, totalBytes = 0;
+  let buffer = '', text = '', completed = false, totalBytes = 0, eventCount = 0;
   const consume = (frame: string) => {
     const data = frame.split('\n').filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n');
     if (!data || data === '[DONE]') return;
+    eventCount++;
     let event: { type: string; delta?: string; error?: { code?: string }; code?: string; response?: { status?: string; error?: { code?: string }; output?: { content?: { type?: string; text?: string }[] }[] } };
     try { event = JSON.parse(data); } catch { throw new AIError('结果解析', 'invalid_event', '模型事件不是合法 JSON。', undefined, response.status, requestId); }
     if (event.type === 'response.failed' || event.type === 'error') throw remoteError('推理请求', response.status, event.response?.error?.code ?? event.error?.code ?? event.code, requestId);
@@ -36,11 +38,15 @@ export async function readResponseStream(response: Response) {
       totalBytes += chunk.value.byteLength;
       if (totalBytes > 4_000_000) throw new AIError('结果解析', 'response_too_large', '模型响应超出本平台文本大小限制。');
       buffer += decoder.decode(chunk.value, { stream: true });
-      buffer = buffer.replace(/\r\n/g, '\n');
+      buffer = buffer.replace(/\r\n?/g, '\n');
       let boundary: number;
       while ((boundary = buffer.indexOf('\n\n')) >= 0) { consume(buffer.slice(0, boundary)); buffer = buffer.slice(boundary + 2); }
     }
-    if (!completed) throw new AIError('结果解析', 'stream_interrupted', '模型流中断，未收到 response.completed。', '已收到的部分文字不会作为有效建议或保存记录。', response.status, requestId);
+    if (!completed && eventCount === 0) {
+      const safeMedia = mediaType.replace(/[^a-z0-9]+/g, '_').slice(0, 50) || 'unknown';
+      throw new AIError('结果解析', `invalid_stream_${safeMedia}`, '服务端返回的内容没有可解析的流式事件。', `响应类型为 ${mediaType}。检查代理或服务端响应；此结果不会作为调用成功或保存。`, response.status, requestId);
+    }
+    if (!completed) throw new AIError('结果解析', 'stream_interrupted', '模型流中断，未收到 response.completed。', `响应类型为 ${mediaType}。已收到的部分文字不会作为有效建议或保存记录。`, response.status, requestId);
     if (!text.trim()) throw new AIError('结果解析', 'empty_response', '模型已结束但没有返回文本。', '本次测试只支持文本，请选择支持文本的模型。', response.status, requestId);
     return { text, requestId };
   } catch (error) { throw normalizeError(error, '结果解析'); }
