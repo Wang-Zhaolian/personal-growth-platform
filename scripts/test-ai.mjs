@@ -111,7 +111,7 @@ test('OS-protected vault: large synthetic token, restart, encrypted bytes, proce
   try {
     const vault = new ProtectedVault(dir, service), record = base(); record.accessToken = 'synthetic-private-token'.repeat(1000);
     await vault.transact(async(data,save)=>{data.registrations.push(record);data.active=record.key;await save();});
-    assert.equal((await readFile(join(dir,'siwc.credentials.enc'))).includes(Buffer.from('synthetic-private-token')),false);
+    assert.equal((await readFile(join(dir,'siwc.credentials.sqlite'))).includes(Buffer.from('synthetic-private-token')),false);
     await new ProtectedVault(dir,service).transact(async data=>assert.equal(data.registrations[0].accessToken.length,record.accessToken.length));
     const childCode = `import { ProtectedVault } from './dist/server/ai-vault.js'; const v=new ProtectedVault(process.argv[1],process.argv[2]); await v.transact(async(d,save)=>{d.registrations[0].label=String(Number(d.registrations[0].label||0)+1);await new Promise(r=>setTimeout(r,100));await save();});`;
     await vault.transact(async(d,save)=>{d.registrations[0].label='0';await save();});
@@ -120,3 +120,17 @@ test('OS-protected vault: large synthetic token, restart, encrypted bytes, proce
   } finally { new Entry(service,'siwc-encryption-key-v1').deletePassword(); if(!resolve(dir).startsWith(resolve(tmpdir()))) throw new Error('Invalid test path'); await rm(dir,{recursive:true,force:true}); }
 });
 function resolvePath(){return resolve('.');}
+test('encrypted SQLite vault commits under the real Windows user-data root', async () => {
+  if (!process.env.LOCALAPPDATA) return;
+  const root = resolve(join(process.env.LOCALAPPDATA, '个人成长平台', 'auth'));
+  const unique = randomUUID(), dir = resolve(join(root, `synthetic-vault-${unique}`)), service = `Zhaolian-synthetic-${unique}`;
+  if (!dir.startsWith(root + '\\')) throw new Error('Refusing to use an unverified probe path.');
+  try {
+    const vault = new ProtectedVault(dir, service);
+    await vault.transact(async (data, save) => { data.registrations.push(base()); await save(); });
+    await new ProtectedVault(dir, service).transact(async data => assert.equal(data.registrations[0].clientId, 'oaiapp_synthetic'));
+  } finally {
+    try { new Entry(service, 'siwc-encryption-key-v1').deletePassword(); } catch {}
+    await rm(dir, { recursive: true, force: true });
+  }
+});

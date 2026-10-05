@@ -47,7 +47,7 @@ AI 建议只有在预览页确认后才写入成长记录或每日任务。成�
 ## 数据与迁移
 
 - SQLite 数据库：`%LOCALAPPDATA%\个人成长平台\growth.db`
-- 模型凭证：用户数据目录 auth/siwc.credentials.enc（AES-256-GCM），加密密钥由 Windows 当前用户系统钥匙串保护；不会以明文降级
+- 模型凭证：用户数据目录 auth/siwc.credentials.sqlite（内部是 AES-256-GCM 密文），加密密钥由 Windows 当前用户系统钥匙串保护；不会以明文降级
 - “设置 → 数据备份与迁移”导出或恢复 JSON 备份。恢复前程序会在本机数据目录留存一次安全备份。
 - 代码由 Git／GitHub 保存；成长数据和模型凭证均不纳入代码仓库。换电脑时克隆代码、运行 `setup.bat`、恢复数据备份，再重新登录模型。
 
