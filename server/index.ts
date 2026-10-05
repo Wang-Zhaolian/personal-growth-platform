@@ -2,7 +2,7 @@ import express from 'express';
 import { join } from 'node:path';
 import { writeFileSync } from 'node:fs';
 import { db, id, now, snapshotItem, dataDir } from './db.js';
-import { answerAuthPrompt, authEvents, beginOpenAILogin, completeJSON, disconnectOpenAI, getAIStatus, isLoginRunning, setSelectedModel } from './ai.js';
+import { answerAuthPrompt, beginOpenAILogin, cancelOpenAILogin, completeJSON, disconnectOpenAI, getAIStatus, getLoginSnapshot, setSelectedModel } from './ai.js';
 import { dailyProposalSchema, dailyReplanSchema, dailyTaskSchema, growthProposalSchema } from './schema.js';
 
 const app = express();
@@ -101,11 +101,15 @@ app.patch('/api/tasks/:id', route((req, res) => {
 }));
 
 app.get('/api/ai/status', route(async (_req, res) => res.json(await getAIStatus())));
-app.get('/api/ai/events', (req, res) => res.json({ events: authEvents(Number(req.query.after ?? 0)), running: isLoginRunning() }));
-app.post('/api/ai/login', route(async (_req, res) => { await beginOpenAILogin(); res.json({ started: true }); }));
+app.get('/api/ai/events', (_req, res) => res.status(410).json({ error: '请改用 /api/ai/status 获取当前授权状态。' }));
+app.post('/api/ai/login', route(async (_req, res) => { res.json({ login: await beginOpenAILogin() }); }));
 app.post('/api/ai/reply', route((req, res) => {
-  if (!answerAuthPrompt(String(req.body.promptId ?? ''), String(req.body.value ?? ''))) throw new Error('登录输入已过期，请重新开始授权。');
+  if (!answerAuthPrompt(String(req.body.attemptId ?? ''), String(req.body.promptId ?? ''), String(req.body.value ?? ''))) throw new Error('登录输入已过期，请重新开始授权。');
   res.json({ ok: true });
+}));
+app.post('/api/ai/cancel', route((req, res) => {
+  if (!cancelOpenAILogin(String(req.body.attemptId ?? ''))) throw new Error('这次授权已结束或已过期。');
+  res.json({ login: getLoginSnapshot() });
 }));
 app.post('/api/ai/logout', route(async (_req, res) => { await disconnectOpenAI(); res.json({ ok: true }); }));
 app.patch('/api/ai/model', route(async (req, res) => { await setSelectedModel(String(req.body.modelId ?? '')); res.json(await getAIStatus()); }));
