@@ -49,7 +49,7 @@ const growthRows = `SELECT i.*, c.name AS category, g.title AS goalTitle,
   FROM growth_items i LEFT JOIN categories c ON c.id=i.category_id LEFT JOIN goals g ON g.id=i.goal_id`;
 let buildId = 'development';
 try { buildId = JSON.parse(readFileSync(join(process.cwd(), 'dist/build-info.json'), 'utf8')).id; } catch { /* development */ }
-app.get('/api/health', (_req, res) => res.json({ ok: true, integration: 'siwc-official-v2', buildId, startedAt: startedAt }));
+app.get('/api/health', (_req, res) => res.json({ ok: true, integration: 'siwc-official-v2', buildId, startedAt: startedAt, dataDir }));
 const startedAt = new Date().toISOString();
 app.get('/api/state', (req, res) => {
   const date = String(req.query.date ?? new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' }));

@@ -1,5 +1,8 @@
 ﻿$ErrorActionPreference = 'Stop'
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$env:LOCALAPPDATA = [Environment]::GetFolderPath('LocalApplicationData')
+# This project's private-client approval was confirmed by the user for this installation.
+$env:GROWTH_SIWC_ELIGIBILITY = 'approved_private'
 $url = 'http://127.0.0.1:4178'
 $expected = (Get-Content -LiteralPath (Join-Path $projectRoot 'dist\build-info.json') -Raw | ConvertFrom-Json).id
 $entry = Join-Path $projectRoot 'dist\server\index.js'
