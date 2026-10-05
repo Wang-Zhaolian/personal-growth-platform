@@ -17,7 +17,7 @@ echo 正在创建桌面快捷方式...
 npm run desktop
 if errorlevel 1 goto failed
 echo.
-echo 安装完成。双击桌面上的“拾阶 · 个人成长平台”即可打开。
+echo 安装完成。双击桌面上的“昭濂个人成长平台”即可打开。
 pause
 exit /b 0
 :failed

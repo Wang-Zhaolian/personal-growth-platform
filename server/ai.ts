@@ -4,6 +4,7 @@ import { createModels, type CredentialStore } from '@earendil-works/pi-ai';
 import type { AuthPrompt } from '@earendil-works/pi-ai';
 import { openaiProvider } from '@earendil-works/pi-ai/providers/openai';
 import { db, now } from './db.js';
+import { assertOutboundNetworkReady, describeOutboundNetworkError, getOutboundNetworkStatus } from './network.js';
 
 const secretEntry = new Entry('PersonalGrowthPlatform', 'pi-ai-credentials');
 const credentialTails = new Map<string, Promise<void>>();
@@ -35,6 +36,9 @@ const store: CredentialStore = {
   },
   modify(providerId, fn) {
     return withCredentialLock(providerId, async () => {
+      if (providerId === 'openai' && login.attemptId && login.phase === 'exchanging') {
+        login = { ...login, phase: 'saving', message: '令牌已取得，正在安全保存授权凭证…' };
+      }
       const all = JSON.parse(secretEntry.getPassword() ?? '{}') as Record<string, never>;
       const current = (all[providerId] as never) ?? undefined;
       const next = await fn(current);
@@ -57,7 +61,7 @@ const store: CredentialStore = {
 export const models = createModels({ credentials: store });
 models.setProvider(openaiProvider());
 
-export type AuthPhase = 'idle' | 'starting' | 'waiting' | 'exchanging' | 'succeeded' | 'failed' | 'cancelled' | 'timed_out';
+export type AuthPhase = 'idle' | 'starting' | 'waiting' | 'exchanging' | 'saving' | 'succeeded' | 'failed' | 'cancelled' | 'timed_out';
 export type LoginPrompt = { id: string; type: AuthPrompt['type']; message: string; placeholder?: string; options?: readonly { id: string; label: string; description?: string }[] };
 export type LoginSnapshot = { attemptId: string | null; phase: AuthPhase; authUrl?: string; instructions?: string; message?: string; error?: string; prompt?: LoginPrompt; expiresAt?: number };
 
@@ -76,8 +80,11 @@ function getOrCreateDeviceId() {
 
 function userFacingAuthError(error: unknown) {
   const message = error instanceof Error ? error.message : String(error);
+  if (/unsupported_country_region_territory/i.test(message)) return 'OpenAI 拒绝了本次令牌请求，提示当前访问地区不受支持。请查看 OpenAI 官方支持地区信息；若你所在地受支持，请联系 OpenAI 支持确认。';
   if (/device ID \(UUID\)/i.test(message)) return '无法读取本机授权标识。请重启应用后重试。';
   if (/port 1455 is in use|EADDRINUSE/i.test(message)) return '授权回调端口 1455 已被占用。请关闭其他 pi 或 ChatGPT 登录窗口后重试。';
+  const networkError = describeOutboundNetworkError(error);
+  if (networkError) return networkError;
   if (/fetch failed|network|ENOTFOUND|ECONNRESET|ETIMEDOUT/i.test(message)) return '无法连接 ChatGPT 授权服务，请检查网络后重试。';
   if (/credential|keyring|keychain|secret service|permission denied|access is denied/i.test(message)) return '系统钥匙串未能保存授权信息。请检查 Windows 凭据管理器权限后重试。';
   if (/must start with http:\/\/127\.0\.0\.1:1455/i.test(message)) return '请粘贴浏览器地址栏中完整的回调链接。';
@@ -99,13 +106,14 @@ function settleLogin(phase: Extract<AuthPhase, 'succeeded' | 'failed' | 'cancell
 export function getLoginSnapshot() { return login; }
 
 export async function beginOpenAILogin() {
-  if (loginController && ['starting', 'waiting', 'exchanging'].includes(login.phase)) return login;
+  assertOutboundNetworkReady();
+  if (loginController && ['starting', 'waiting', 'exchanging', 'saving'].includes(login.phase)) return login;
   const attemptId = randomUUID();
   loginController = new AbortController();
   const controller = loginController;
   login = { attemptId, phase: 'starting', message: '正在启动 ChatGPT 授权…', expiresAt: Date.now() + 5 * 60_000 };
   loginTimeout = setTimeout(() => {
-    if (login.attemptId !== attemptId || !['starting', 'waiting', 'exchanging'].includes(login.phase)) return;
+    if (login.attemptId !== attemptId || !['starting', 'waiting', 'exchanging', 'saving'].includes(login.phase)) return;
     settleLogin('timed_out', '授权等待超过 5 分钟，请重试。');
     controller.abort();
   }, 5 * 60_000);
@@ -130,7 +138,7 @@ export async function beginOpenAILogin() {
     notify: (event) => {
       if (login.attemptId !== attemptId) return;
       if (event.type === 'auth_url') login = { ...login, phase: 'waiting', authUrl: event.url, instructions: event.instructions, message: '请在浏览器中完成 ChatGPT 登录。' };
-      if (event.type === 'progress') login = { ...login, phase: 'exchanging', message: event.message };
+      if (event.type === 'progress') login = { ...login, phase: 'exchanging', message: '正在向 OpenAI 兑换授权令牌…' };
       if (event.type === 'device_code') login = { ...login, phase: 'waiting', message: '请使用下方代码完成授权。' };
       if (event.type === 'info') login = { ...login, message: event.message };
     },
@@ -156,7 +164,7 @@ export function answerAuthPrompt(attemptId: string, promptId: string, value: str
 }
 
 export function cancelOpenAILogin(attemptId: string) {
-  if (login.attemptId !== attemptId || !loginController || !['starting', 'waiting', 'exchanging'].includes(login.phase)) return false;
+  if (login.attemptId !== attemptId || !loginController || !['starting', 'waiting', 'exchanging', 'saving'].includes(login.phase)) return false;
   settleLogin('cancelled', '已取消授权。');
   loginController.abort();
   return true;
@@ -172,7 +180,7 @@ export async function getAIStatus() {
   const availableModels = models.getModels('openai').map((model) => ({ id: model.id, name: model.name }));
   const persisted = db.prepare("SELECT value FROM settings WHERE key='model_id'").get() as { value: string } | undefined;
   const selected = process.env.GROWTH_MODEL_ID || persisted?.value || 'gpt-4o-mini';
-  return { configured, login, provider: 'openai', selectedModel: availableModels.some((model) => model.id === selected) ? selected : (availableModels[0]?.id ?? selected), models: availableModels };
+  return { configured, login, network: getOutboundNetworkStatus(), provider: 'openai', selectedModel: availableModels.some((model) => model.id === selected) ? selected : (availableModels[0]?.id ?? selected), models: availableModels };
 }
 
 export async function setSelectedModel(modelId: string) {
@@ -182,14 +190,20 @@ export async function setSelectedModel(modelId: string) {
 }
 
 export async function completeJSON<T>(systemPrompt: string, input: string, parse: (text: string) => T) {
+  assertOutboundNetworkReady();
   const state = await getAIStatus();
   if (!state.configured) throw new Error('请先在设置中连接 ChatGPT。');
   const model = models.getModel('openai', state.selectedModel);
   if (!model) throw new Error('模型不可用，请在设置中重新选择模型。');
-  const result = await models.complete(model, {
-    systemPrompt,
-    messages: [{ role: 'user', content: input, timestamp: Date.now() }],
-  });
+  let result;
+  try {
+    result = await models.complete(model, {
+      systemPrompt,
+      messages: [{ role: 'user', content: input, timestamp: Date.now() }],
+    });
+  } catch (error) {
+    throw new Error(userFacingAuthError(error));
+  }
   const text = result.content.filter((block) => block.type === 'text').map((block) => block.text).join('\n');
   if (!text) throw new Error('模型没有返回整理结果，请重试。');
   const cleaned = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
