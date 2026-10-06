@@ -1,4 +1,4 @@
-export type Stage = '授权' | '权限检查' | '模型列表' | '推理请求' | '结果解析' | '业务校验' | '数据保存' | '界面刷新';
+export type Stage = '授权' | '权限检查' | '模型列表' | '推理请求' | '结果解析' | '业务校验' | '数据保存' | '界面刷新' | '附件校验' | '附件读取' | '附件删除';
 export type Diagnostic = { stage: Stage; code: string; httpStatus?: number; requestId?: string; message: string; advice: string; at: string };
 const safeCode = (value: unknown) => typeof value === 'string' && /^[\w.-]{1,100}$/.test(value) ? value : 'unknown_error';
 export class AIError extends Error {

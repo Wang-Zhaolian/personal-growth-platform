@@ -134,7 +134,23 @@ try {
   assert.ok(narrowView.scrollWidth <= narrowView.innerWidth, `Narrow viewport overflows horizontally: ${JSON.stringify(narrowView)}`);
   assert.ok(narrowView.cardWidth > 0);
   assert.deepEqual(runtimeErrors, []);
-  console.log('Chrome smoke test passed: brand/title, proxy status, progress card, and 390px layout.');
+  await send('Emulation.clearDeviceMetricsOverride');
+  await evaluate("Array.from(document.querySelectorAll('.page-heading button')).find(el=>el.textContent.includes('手动新增'))?.click()");
+  await delay(150);
+  assert.equal(await evaluate("Boolean(document.querySelector('.editor-modal'))"), true, 'Growth section should expose a direct manual editor.');
+  assert.equal(await evaluate("Boolean(document.querySelector('.editor-grid input[type=date][required]'))"), true, 'New active records must require a deadline.');
+  assert.match(await evaluate('document.querySelector(".ai-composer input[type=file]")?.accept ?? ""'),/\.png.*\.pdf.*\.docx/);
+  await evaluate("Array.from(document.querySelectorAll('.editor-modal .subtle-button')).at(-1)?.click()");
+  await evaluate("Array.from(document.querySelectorAll('.side-nav .nav-item')).find((el)=>el.textContent.includes('每日任务'))?.click()");
+  await delay(250);
+  assert.match(await evaluate('document.querySelector(".budget-value")?.innerText ?? ""'),/12小时/);
+  assert.equal(await evaluate("Array.from(document.querySelector('.budget-value select')?.options??[]).some(option=>option.value==='0.5')"),true,'Daily budget picker should allow half-hour values.');
+  await evaluate("Array.from(document.querySelector('.page-heading')?.querySelectorAll('button')??[]).find(el=>el.textContent.includes('手动添加'))?.click()");
+  await delay(150);
+  assert.match(await evaluate("document.querySelector('.editor-modal')?.innerText ?? ''"),/预计用时（分钟）/);
+  assert.doesNotMatch(await evaluate("document.querySelector('.editor-modal')?.innerText ?? ''"),/开始时间|结束时间/);
+  assert.deepEqual(runtimeErrors, []);
+  console.log('Chrome smoke test passed: brand/icon, proxy status, progress card, 390px layout, manual forms, attachment affordance, and budget-only daily planning.');
 } catch (error) {
   console.error(error);
   if (appError) console.error(appError);

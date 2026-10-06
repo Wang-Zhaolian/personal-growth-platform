@@ -106,9 +106,12 @@ test('account model catalog and actual Responses request use documented protocol
   const inference = new ChatGPTInference(auth,async (url,init) => {
     if (String(url).endsWith('/models')) return response({models:[{slug:'actual-slug',display_name:'Display',visibility:'list'}]});
     const body=JSON.parse(init.body); assert.deepEqual(Object.keys(body).sort(),['input','instructions','model','store','stream']); assert.equal(body.store,false); assert.equal(body.stream,true); assert.equal(body.model,'actual-slug');
+    if(Array.isArray(body.input[0].content)) assert.deepEqual(body.input[0].content,multimodal);
     return stream([{type:'response.output_text.delta',delta:'ok'},{type:'response.completed',response:{status:'completed'}}]);
   });
   assert.equal((await inference.text('actual-slug','Be brief','Synthetic test')).text,'ok');
+  const multimodal=[{type:'input_image',image_url:'data:image/png;base64,cG5n',detail:'auto'},{type:'input_file',filename:'notes.pdf',file_data:'data:application/pdf;base64,cGRm'},{type:'input_text',text:'请整理附件内容。'}];
+  assert.equal((await inference.text('actual-slug','Read supported attachments',multimodal)).text,'ok');
 });
 test('OS-protected vault: large synthetic token, restart, encrypted bytes, process lock', async () => {
   const dir = await mkdtemp(join(tmpdir(),'zhaolian-ai-vault-')), service=`Zhaolian-synthetic-test-${randomUUID()}`;

@@ -4,8 +4,9 @@ import { db, dataDir } from './db.js';
 import { getOutboundNetworkStatus } from './network.js';
 import { ChatGPTAuth } from './ai-auth.js';
 import { ProtectedVault } from './ai-vault.js';
-import { ChatGPTInference } from './ai-inference.js';
+import { ChatGPTInference, type ResponseInputPart } from './ai-inference.js';
 import { AIError, normalizeError, type Diagnostic } from './ai-errors.js';
+import { readAttachment, type SavedAttachment } from './attachments.js';
 
 export function recordDiagnostic(diagnostic: Diagnostic) {
   try {
@@ -49,16 +50,23 @@ export async function testConnection() {
   await auth.markVerified(result.accountKey, model);
   return { ok: true, message: '已验证可调用：收到完整响应 Hello, world!', model, requestId: result.requestId };
 }
-export async function completeJSON<T>(systemPrompt: string, input: string, parse: (text: string) => T) {
+export async function completeJSON<T>(systemPrompt: string, input: string, parse: (text: string) => T, attachments: SavedAttachment[] = [], onInvalidResult?: (raw: string) => void) {
   const status = await getAIStatus();
   if (!status.verified || status.verified.model !== status.selectedModel) throw new AIError('权限检查', 'connection_test_required', '请先在设置中主动测试当前账号与模型。', '测试只发送合成短文本；验证通过后再提交个人成长内容。');
   if (!(await getAIStatus()).models.length) await refreshModels();
-  const result = await inference.text(setting('model_id') ?? '', systemPrompt, input);
+  const content: ResponseInputPart[] = attachments.map((attachment) => {
+    const file = readAttachment(attachment.id);
+    const encoded = `data:${file.mimeType};base64,${file.buffer.toString('base64')}`;
+    return file.mimeType.startsWith('image/')
+      ? { type: 'input_image' as const, image_url: encoded, detail: 'auto' as const }
+      : { type: 'input_file' as const, filename: file.filename, file_data: encoded };
+  });
+  if (input.trim()) content.push({ type: 'input_text', text: input });
+  const result = await inference.text(setting('model_id') ?? '', systemPrompt, attachments.length ? content : input);
   const cleaned = result.text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
   try { return parse(cleaned); }
   catch (error) {
-    try { db.prepare('INSERT INTO ai_drafts(id,section,raw_input,proposal,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?)').run(randomUUID(), 'ai_failed_result', input, JSON.stringify({ rawResult: result.text }), 'pending', new Date().toISOString(), new Date().toISOString()); }
-    catch (saveError) { throw normalizeError(saveError, '数据保存'); }
-    throw new AIError(error instanceof SyntaxError ? '结果解析' : '业务校验', 'invalid_ai_result', 'AI 结果格式不符合要求，原始结果已保留在本机失败记录中。', '修改输入后重试；可下载备份查看原始结果，未写入正式成长记录。');
+    onInvalidResult?.(result.text);
+    throw new AIError(error instanceof SyntaxError ? '结果解析' : '业务校验', 'invalid_ai_result', 'AI 结果格式不符合要求，输入和建议已留在本机待处理草稿。', '检查保留的原始结果、调整输入后重试；未写入正式成长记录。');
   }
 }

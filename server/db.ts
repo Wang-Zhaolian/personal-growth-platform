@@ -27,12 +27,16 @@ CREATE TABLE IF NOT EXISTS daily_plans (date TEXT PRIMARY KEY, budget_minutes IN
 CREATE TABLE IF NOT EXISTS daily_tasks (
   id TEXT PRIMARY KEY, plan_date TEXT NOT NULL, title TEXT NOT NULL, estimate_minutes INTEGER NOT NULL,
   actual_minutes INTEGER, priority INTEGER NOT NULL DEFAULT 2, completion_criteria TEXT NOT NULL DEFAULT '',
-  item_id TEXT, status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','done','cancelled')),
+  item_id TEXT, continued_from TEXT, status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','done','cancelled')),
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY(plan_date) REFERENCES daily_plans(date), FOREIGN KEY(item_id) REFERENCES growth_items(id)
 );
 CREATE TABLE IF NOT EXISTS ai_drafts (
-  id TEXT PRIMARY KEY, section TEXT NOT NULL, raw_input TEXT NOT NULL, proposal TEXT NOT NULL,
+  id TEXT PRIMARY KEY, section TEXT NOT NULL, raw_input TEXT NOT NULL, proposal TEXT NOT NULL, attachment_ids TEXT NOT NULL DEFAULT '[]', attachment_meta TEXT NOT NULL DEFAULT '[]',
   status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','applied','dismissed')), created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ai_attachments (
+  id TEXT PRIMARY KEY, draft_id TEXT, filename TEXT NOT NULL, mime_type TEXT NOT NULL, size INTEGER NOT NULL,
+  disk_name TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL, FOREIGN KEY(draft_id) REFERENCES ai_drafts(id) ON DELETE SET NULL
 );
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
@@ -65,6 +69,16 @@ if (!growthColumns.has('version')) {
   await db.backup(join(dataDir, `before-version-migration-${Date.now()}.sqlite`));
   db.exec('ALTER TABLE growth_items ADD COLUMN version INTEGER NOT NULL DEFAULT 0');
 }
+const draftColumns = new Set((db.pragma('table_info(ai_drafts)') as { name: string }[]).map((column) => column.name));
+const taskColumns=new Set((db.pragma('table_info(daily_tasks)') as {name:string}[]).map(column=>column.name));
+if (!draftColumns.has('attachment_ids') || !draftColumns.has('attachment_meta') || !taskColumns.has('continued_from')) {
+  await db.backup(join(dataDir, `before-planning-attachments-migration-${Date.now()}.sqlite`));
+  if (!draftColumns.has('attachment_ids')) db.exec("ALTER TABLE ai_drafts ADD COLUMN attachment_ids TEXT NOT NULL DEFAULT '[]'");
+  if (!draftColumns.has('attachment_meta')) db.exec("ALTER TABLE ai_drafts ADD COLUMN attachment_meta TEXT NOT NULL DEFAULT '[]'");
+  if(!taskColumns.has('continued_from')) db.exec('ALTER TABLE daily_tasks ADD COLUMN continued_from TEXT');
+}
+db.prepare('INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(5,?)').run(new Date().toISOString());
+db.exec('CREATE UNIQUE INDEX IF NOT EXISTS daily_tasks_single_continuation ON daily_tasks(continued_from) WHERE continued_from IS NOT NULL');
 db.exec(`CREATE TRIGGER IF NOT EXISTS growth_item_version AFTER UPDATE ON growth_items
 WHEN NEW.version = OLD.version BEGIN UPDATE growth_items SET version = OLD.version + 1 WHERE id = NEW.id; END;`);
 export const id = () => crypto.randomUUID();

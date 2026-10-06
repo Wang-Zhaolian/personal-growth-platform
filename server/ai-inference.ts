@@ -1,6 +1,7 @@
 import { AIError, checkedFetch, normalizeError, remoteError } from './ai-errors.js';
 import { RESOURCE, type ChatGPTAuth } from './ai-auth.js';
 export type ModelChoice = { id: string; name: string };
+export type ResponseInputPart = { type: 'input_text'; text: string } | { type: 'input_image'; image_url: string; detail: 'auto' } | { type: 'input_file'; filename: string; file_data: string };
 export function parseModels(value: unknown): ModelChoice[] {
   if (!value || typeof value !== 'object' || !Array.isArray((value as { models?: unknown }).models)) throw new AIError('模型列表', 'invalid_catalog', '模型列表不是此订阅流程要求的 models 数组。');
   const models = (value as { models: unknown[] }).models.filter((item): item is { slug: string; display_name: string; visibility: string } => Boolean(item && typeof item === 'object' && (item as { visibility?: string }).visibility === 'list' && typeof (item as { slug?: string }).slug === 'string' && typeof (item as { display_name?: string }).display_name === 'string'));
@@ -64,7 +65,7 @@ export class ChatGPTInference {
     try { json = await response.json(); } catch { throw new AIError('模型列表', 'invalid_catalog', '无法解析账号模型列表。'); }
     const models = parseModels(json); this.catalog = { key: record.key, at: Date.now(), models }; return models;
   }
-  async text(model: string, instructions: string, input: string) {
+  async text(model: string, instructions: string, input: string | ResponseInputPart[]) {
     const record = await this.auth.credential();
     if (!this.catalog || this.catalog.key !== record.key || Date.now() - this.catalog.at > 300_000) await this.models();
     if (!this.cached(record.key).some(m => m.id === model)) throw new AIError('模型列表', 'model_not_available', '所选模型不在当前账号可用列表中。', '刷新模型列表并重新选择。');

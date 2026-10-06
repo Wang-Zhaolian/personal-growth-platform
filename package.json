@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.app.json && tsc --noEmit -p tsconfig.server.json",
     "desktop": "powershell -ExecutionPolicy Bypass -File scripts/create-shortcut.ps1",
     "test:progress": "npm run build && node scripts/smoke-progress.mjs",
+    "test:features": "npm run build && node scripts/smoke-features.mjs",
     "test:browser": "npm run build && node scripts/smoke-browser.mjs",
     "test:ai": "npm run build && node --test scripts/test-ai.mjs"
   },
@@ -19,6 +20,7 @@
     "concurrently": "^9.2.0",
     "express": "^5.1.0",
     "jose": "6.2.12",
+    "multer": "^2.4.0",
     "proper-lockfile": "4.1.2",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
@@ -28,6 +30,7 @@
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/express": "^5.0.3",
+    "@types/multer": "^2.3.0",
     "@types/node": "^24.0.0",
     "@types/proper-lockfile": "4.1.4",
     "@types/react": "^19.1.0",

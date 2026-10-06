@@ -91,7 +91,8 @@ try {
   const literalNone = await request(`/api/drafts/${failedDraft}/apply`, { method: 'POST', body: JSON.stringify({suggestions:[{...failureProposal.suggestions[0],id:'None'}]}) });
   assert.equal(literalNone.response.status,400);
   const duplicateCreate = await request(`/api/drafts/${missingDeadlineDraftId}/apply`, { method: 'POST', body: '{}' });
-  assert.equal(duplicateCreate.response.status,400);
+  assert.equal(duplicateCreate.response.status,200);
+  assert.equal(duplicateCreate.body.alreadyApplied,true);
 
   const updateDraftId = randomUUID();
   const updateProposal = {
@@ -129,7 +130,8 @@ try {
 
   const backupResponse = await fetch(`${baseUrl}/api/backup`);
   const backup = await backupResponse.json();
-  assert.equal(backup.version, 3);
+  assert.equal(backup.version, 5);
+  assert.equal(backup.tables.ai_drafts.every((entry) => entry.attachment_ids === '[]'), true);
   assert.equal(backup.tables.growth_items.find((entry) => entry.id === item.id).version, restored.version);
   assert.equal(backup.tables.growth_items.find((entry) => entry.id === item.id).progress_percent, 30);
   const legacy = structuredClone(backup);
@@ -148,7 +150,7 @@ try {
   assert.equal(aiStatus.response.status, 200);
   assert.ok(aiStatus.body.network?.source);
   assert.equal('proxyUrl' in aiStatus.body.network, false);
-  console.log('Progress acceptance, required deadline, estimate provenance, undo, v2 backup, v1 restore, and sanitized network status passed.');
+  console.log('Progress acceptance, required deadline, estimate provenance, undo, v5 backup, v1 restore, and sanitized network status passed.');
 } catch (error) {
   console.error(error);
   if (stderr) console.error(stderr);
